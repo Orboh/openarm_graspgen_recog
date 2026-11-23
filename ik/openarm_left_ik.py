@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""OpenArm 左腕 IK（lerobot 駆動用の再利用モジュール）.
+"""OpenArm 左腕・右腕の IK（lerobot 駆動用の再利用モジュール）.
+
+2026-11-22（作業者: Munenori）: 右腕にも使えるように OpenArmIK(side=...) にした。OpenArmLeftIK は左の別名として残す。
 
 bimanual URDF を pinocchio で読み、右腕+指をロックした左腕7-DOF reduced model で、
 TCP フレーム（グリッパ先端）をカルテシアン目標へ持っていく damped-LS CLIK。
@@ -29,10 +31,17 @@ LEROBOT_JOINTS = [f"joint_{i}" for i in range(1, 8)]               # lerobot (de
 TCP_FRAME = "openarm_left_hand_tcp"
 
 
-class OpenArmLeftIK:
-    def __init__(self, urdf_path: str = DEFAULT_URDF, ee_frame: str = TCP_FRAME):
+class OpenArmIK:
+    """片腕（side = "left" か "right"）の 7 自由度の IK。もう片方の腕と指は固定する。"""
+
+    def __init__(self, urdf_path: str = DEFAULT_URDF, ee_frame: str | None = None, side: str = "left"):
+        if side not in ("left", "right"):
+            raise ValueError(f"side は left か right: {side!r}")
+        self.side = side
+        arm_joints = [f"openarm_{side}_joint{i}" for i in range(1, 8)]
+        ee_frame = ee_frame or f"openarm_{side}_hand_tcp"
         full = pin.buildModelFromUrdf(urdf_path)
-        lock = [j for j in range(1, full.njoints) if full.names[j] not in LEFT_ARM_JOINTS]
+        lock = [j for j in range(1, full.njoints) if full.names[j] not in arm_joints]
         self.model = pin.buildReducedModel(full, lock, pin.neutral(full))
         self.data = self.model.createData()
         # EE: TCP フレームがあれば使う。無ければ joint7 にフォールバック。
@@ -41,61 +50,35 @@ class OpenArmLeftIK:
             self.use_frame = True
             self.ee_name = ee_frame
         else:
-            self.ee_jid = self.model.getJointId("openarm_left_joint7")
+            self.ee_jid = self.model.getJointId(f"openarm_{side}_joint7")
             self.use_frame = False
-            self.ee_name = "openarm_left_joint7(fallback)"
+            self.ee_name = f"openarm_{side}_joint7(fallback)"
         self.lo = np.where(np.isfinite(self.model.lowerPositionLimit),
                            self.model.lowerPositionLimit, -np.pi)
         self.hi = np.where(np.isfinite(self.model.upperPositionLimit),
                            self.model.upperPositionLimit, np.pi)
-        # 2026-11-22 (Sota: 左手を使えるようにしよ): with the jaws tilted the real left arm was 21-29 mm off this model
-        # (wrist markers in the chest camera, handeye_near_20261122_161236 / _162408). grasp/tools/fit_left_arm_corr.py
-        # fitted joint zero offsets + a base correction (held-out median 19.7 -> 5.4 mm). actual = LC * model(q + q_off).
-        # Only for the left arm (the right arm has its own C in ik/openarm_right_ik.py). GRASP_LEFT_CORR=none turns it off
-        # (the camera / correction fits themselves must use the plain model).
-        self.q_off = np.zeros(self.model.nq)
-        self._lc = pin.SE3.Identity()
-        if type(self) is OpenArmLeftIK and os.environ.get("GRASP_LEFT_CORR", "") != "none":
-            import json
-            cp = os.environ.get("GRASP_LEFT_CORR") or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                                                    "grasp", "config", "left_arm_corr.json")
-            if os.path.exists(cp):
-                from scipy.spatial.transform import Rotation
-                c = json.load(open(cp))
-                self.q_off = np.deg2rad(np.asarray(c["joint_offsets_deg"], float))
-                dR = Rotation.from_rotvec(c["camera_delta"]["rotvec"]).as_matrix(); dt = np.asarray(c["camera_delta"]["t_m"], float)
-                self._lc = pin.SE3(dR.T, -dR.T @ dt)  # fitted: dR*p_base + dt = model point  ->  real = dR^T (model - dt)
-                self.C = self._lc  # grasp/arm_collision.py applies ik.C (and ik.q_off) to the arm's shape too
-                self.corr_path = cp
 
     def fk(self, q) -> pin.SE3:
-        # the right-arm class builds its own model without this __init__: no q_off / _lc there
-        q = np.asarray(q, dtype=float) + getattr(self, "q_off", 0.0)
+        q = np.asarray(q, dtype=float)
         pin.forwardKinematics(self.model, self.data, q)
-        lc = getattr(self, "_lc", None)
         if self.use_frame:
             pin.updateFramePlacements(self.model, self.data)
-            M = self.data.oMf[self.ee_fid].copy()
-        else:
-            M = self.data.oMi[self.ee_jid].copy()
-        return lc * M if lc is not None else M
+            return self.data.oMf[self.ee_fid].copy()
+        return self.data.oMi[self.ee_jid].copy()
 
     def _jac(self, q):
-        q = np.asarray(q, dtype=float) + getattr(self, "q_off", 0.0)  # LOCAL frame: the left factor _lc does not change it
         if self.use_frame:
             return pin.computeFrameJacobian(self.model, self.data, q, self.ee_fid)
         return pin.computeJointJacobian(self.model, self.data, q, self.ee_jid)
 
     def _jac_world_pos(self, q):
         """EE フレームの位置ヤコビアン(3xnv, world-aligned)。位置サーボ用。"""
-        q = np.asarray(q, dtype=float) + getattr(self, "q_off", 0.0)
         if self.use_frame:
             J = pin.computeFrameJacobian(self.model, self.data, q, self.ee_fid,
                                          pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
         else:
             J = pin.computeJointJacobian(self.model, self.data, q, self.ee_jid)
-        lc = getattr(self, "_lc", None)
-        return lc.rotation @ J[:3, :] if lc is not None else J[:3, :]
+        return J[:3, :]
 
     def solve(self, target: pin.SE3, q_seed, position_only: bool = True,
               max_iter: int = 300, eps: float = 1e-4, damp: float = 1e-4, dt: float = 1.0):
@@ -135,6 +118,13 @@ class OpenArmLeftIK:
     def within_limits(self, q) -> bool:
         q = np.asarray(q, float)
         return bool(np.all(q >= self.lo - 1e-6) and np.all(q <= self.hi + 1e-6))
+
+
+class OpenArmLeftIK(OpenArmIK):
+    """左腕の IK（前からの名前）。"""
+
+    def __init__(self, urdf_path: str = DEFAULT_URDF, ee_frame: str = TCP_FRAME):
+        super().__init__(urdf_path, ee_frame, side="left")
 
 
 # ---- lerobot 橋渡し（度 <-> ラジアン・joint_k <-> 配列 index）-------------------

@@ -23,11 +23,14 @@ FINGER_OPEN_M = float(os.environ.get("GRASP_CUROBO_FINGER_OPEN_M", "0.04"))
 TABLE_THICK = 0.10
 
 
-def robot_cfg_dict() -> Dict:
-    """cuRobo の RobotCfg.create に渡す辞書。"""
+def robot_cfg_dict(side: str = "left") -> Dict:
+    """cuRobo の RobotCfg.create に渡す辞書。side="right" は右腕用に球を置き直した物（right_local_center・MirroredArm と使う）。"""
     d = yaml.safe_load(open(ROBOT_YML))
     d = d.get("robot_cfg", d)
     k = d["kinematics"]
+    if side == "right":
+        k["collision_spheres"] = {ln: [dict(sp, center=right_local_center(ln, sp["center"]).tolist()) for sp in sps]
+                                  for ln, sps in k["collision_spheres"].items()}
     k["urdf_path"] = os.path.join(HERE, "openarm_left_umi.urdf")
     k["asset_root_path"] = HERE
     k["lock_joints"] = {FINGER_JOINT: FINGER_OPEN_M}
@@ -138,10 +141,40 @@ def _mesh_sd_kernel():
     return _KERNEL
 
 
+def sphere_spheres_distance(S: np.ndarray, O: np.ndarray, chunk: int = 8192) -> np.ndarray:
+    """腕の球（(..., S, 4)）の表面から、動かない球の集まり O（(K, 4)）の一番近い表面までの距離（(..., S)）。
+    GPU（torch）があればそこで、無ければ numpy で（サーバーの check_path が 1 回 0.3 秒かかったので GPU に移した・2026-11-22）。"""
+    flat = S.reshape(-1, 4)
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            raise ImportError
+        a = torch.as_tensor(flat, dtype=torch.float32, device="cuda:0")
+        o = torch.as_tensor(np.asarray(O), dtype=torch.float32, device="cuda:0")
+        outs = []
+        for i in range(0, len(a), chunk):
+            d = torch.cdist(a[i:i + chunk, :3], o[:, :3]) - o[None, :, 3]
+            outs.append(d.min(1).values - a[i:i + chunk, 3])
+        return torch.cat(outs).cpu().numpy().astype(float).reshape(S.shape[:-1])
+    except ImportError:
+        out = np.empty(len(flat))
+        for i in range(0, len(flat), chunk):
+            b = flat[i:i + chunk]
+            d = np.linalg.norm(b[:, None, :3] - O[None, :, :3], axis=-1) - O[None, :, 3]
+            out[i:i + chunk] = d.min(1) - b[:, 3]
+        return out.reshape(S.shape[:-1])
+
+
 def obstacle_distances(S: np.ndarray, world: Dict, meshes: Optional[List[MeshDistance]] = None,
                        sphere_links: Optional[List[str]] = None) -> Dict[str, np.ndarray]:
-    """周りの物ごとに、球（(..., S, 4)）の表面からの距離（(..., S)）。メッシュの ignore_links の球は +inf。"""
+    """周りの物ごとに、球（(..., S, 4)）の表面からの距離（(..., S)）。メッシュ・球の集まりの ignore_links の球は +inf。
+    world["spheres"]（あれば）は動かない球の集まり [{"name", "spheres": (K, 4), "ignore_links"}]（休んでいるもう片方の腕）。"""
     out = {c["name"]: sphere_cuboid_distance(S, c) for c in world["cuboid"]}
+    for sg in world.get("spheres") or []:
+        D = sphere_spheres_distance(S, np.asarray(sg["spheres"], float))
+        if sg.get("ignore_links") and sphere_links:
+            D[..., np.array([l in sg["ignore_links"] for l in sphere_links])] = np.inf
+        out[sg["name"]] = D
     for md in meshes or []:
         D = md.distance(S)
         if md.ignore_links and sphere_links:
@@ -151,13 +184,14 @@ def obstacle_distances(S: np.ndarray, world: Dict, meshes: Optional[List[MeshDis
 
 
 class ArmSpheres:
-    """cuRobo の FK で、関節角（rad・関節 1〜7）から当たり判定の球を出す。"""
+    """cuRobo の FK で、関節角（rad・関節 1〜7）から当たり判定の球を出す。side="right" は MirroredArm の中身（左の運動学で右の球）。"""
 
-    def __init__(self):
+    def __init__(self, side: str = "left"):
         import torch
         from curobo.kinematics import Kinematics, KinematicsCfg
         self.torch = torch
-        self.kin = Kinematics(KinematicsCfg.from_data_dict(robot_cfg_dict()))
+        self.side = side
+        self.kin = Kinematics(KinematicsCfg.from_data_dict(robot_cfg_dict(side)))
         self.joint_names = list(self.kin.joint_names)
         idx = [self.joint_names.index(j) for j in ARM_JOINTS]
         self._idx = idx
@@ -167,7 +201,7 @@ class ArmSpheres:
         """球ごとの link の名前（球の並びの順）。"""
         kc = self.kin.kinematics_config
         names = [""] * int(kc.total_spheres)
-        for link in robot_cfg_dict()["robot_cfg"]["kinematics"]["collision_link_names"]:
+        for link in robot_cfg_dict(self.side)["robot_cfg"]["kinematics"]["collision_link_names"]:
             for i in np.atleast_1d(kc.get_sphere_index_from_link_name(link).cpu().numpy()):
                 names[int(i)] = link
         return names
@@ -200,3 +234,105 @@ class ArmSpheres:
         for i in range(len(q)):
             T[i, :3, :3] = _quat_wxyz_to_R(qq[i]); T[i, :3, 3] = p[i]
         return T
+
+
+# ---------- 右腕（2026-11-22 Munenori）: 左のモデルを鏡に写して使う ----------
+# 左右の腕の関節と link の枠は付け根の座標の y の鏡写し（grasp/arm.py）。ただし URDF の右腕の各 link の形は、左の形の鏡写しではなく
+# 同じ部品を右の枠に置いた物（左を鏡に写すと link7 で最大 58 mm・ほかは 4〜22 mm ずれる・2026-11-22 に頂点で測った）。そこで:
+#   右の球の中心（右の link の座標）= 左の yml の中心そのまま。右の枠 T_右,k = M T_左,k M D_k（D_k は link4 だけ y に 63 mm ずらす）
+#   → 左の運動学で中心 M D_k c に置いた球を、付け根の座標で y 反転すると T_右,k c になる（right_local_center・MirroredArm）
+#   グリッパー（指・手の本体）は右に鏡写しに付ける（Munenori 確認）ので、左の球をそのまま鏡に写す（中心はそのまま）。
+# link7 の姿勢は M T_左 M。
+# 周りの物（箱・本体のメッシュ・カメラで見た点）は本当の座標のまま比べる。cuRobo の経路計画（planner.py）だけは左のモデルで解くので、
+# 周りの物の方を鏡に写して渡す（mirror_world）。
+
+
+class MirroredArm:
+    """右腕の球と link7 の姿勢（left は ArmSpheres(side="right")＝左の運動学に右用の球。それを鏡に写す）。sphere_links は左の名前のまま（"openarm_left_" を外して報告する）。"""
+
+    def __init__(self, left):
+        from grasp.arm import mirror_q
+        self.left = left
+        self._mq = mirror_q
+        self.sphere_links = left.sphere_links
+
+    def spheres(self, q_rad: np.ndarray) -> np.ndarray:
+        S = np.array(self.left.spheres(self._mq(np.atleast_2d(q_rad))), copy=True)
+        S[..., 1] *= -1.0
+        return S
+
+    def link7_pose(self, q_rad: np.ndarray) -> np.ndarray:
+        from grasp.arm import mirror_T
+        return mirror_T(self.left.link7_pose(self._mq(np.atleast_2d(q_rad))))
+
+
+def mirror_world(world: Dict) -> Dict:
+    """周りの物を y で鏡に写す（右腕の経路を左のモデルで解くため）。メッシュは mirror の印を付け、頂点を写すのは planner.scene_dict。"""
+    from grasp.arm import mirror_points, mirror_pose_wxyz
+    out = {"cuboid": [dict(c, pose=mirror_pose_wxyz(c["pose"])) for c in world["cuboid"]],
+           "mesh": [dict(m, mirror=not m.get("mirror", False)) for m in world["mesh"]]}
+    if world.get("spheres"):
+        out["spheres"] = [dict(sg, spheres=mirror_points(sg["spheres"]),
+                               boxes=[dict(b, pose=mirror_pose_wxyz(b["pose"])) for b in sg.get("boxes", [])])
+                          for sg in world["spheres"]]
+    return out
+
+
+# ---------- 休んでいるもう片方の腕（2026-11-22 Munenori）----------
+# 肩の間は約 19 cm で、片方の腕が反対側の物を掴みに行くと、休んでいる腕に当たりうる。カメラに写らない所も見落とさないよう、
+# 各サーバーはもう片方の腕を、休みの姿勢（左 GRASP_REST・右 GRASP_REST_RIGHT）の球の集まりとして周りの物に入れる。
+# 付け根（link0）は両腕とも本体にねじ止めで動かず、両腕の link0 どうしは数 cm しか離れていないので、もう片方の link0 の球は入れず、
+# こちらの link0 の球もこれとは比べない。経路計画（cuRobo の MotionPlanner）には link ごとの外接の箱で渡す（球より大きい側）。
+OTHER_ARM = "other_arm"
+
+
+def other_arm_obstacle(side: str, q_deg) -> Optional[Dict]:
+    """side の腕から見た、もう片方の腕（関節角 q_deg [deg]）の球の集まり。q_deg が None なら None。"""
+    if q_deg is None:
+        return None
+    other = "right" if side == "left" else "left"
+    arm = ArmSpheres() if other == "left" else MirroredArm(ArmSpheres(side="right"))
+    S = arm.spheres(np.deg2rad([list(q_deg)]))[0]
+    links = np.array(arm.sphere_links)
+    keep = (S[:, 3] > 0) & (links != "openarm_left_link0")
+    S, links = S[keep], links[keep]
+    boxes = []
+    for ln in dict.fromkeys(links):
+        P = S[links == ln]
+        lo, hi = (P[:, :3] - P[:, 3:]).min(0), (P[:, :3] + P[:, 3:]).max(0)
+        boxes.append(dict(name=f"{OTHER_ARM}_{ln.replace('openarm_left_', '')}", dims=(hi - lo).tolist(),
+                          pose=[*((lo + hi) / 2).tolist(), 1, 0, 0, 0]))
+    return {"name": OTHER_ARM, "spheres": S, "ignore_links": ["openarm_left_link0"], "boxes": boxes,
+            "q_deg": [float(v) for v in q_deg], "arm": other}
+
+
+_D_RIGHT = None
+GRIPPER_LINKS = ("openarm_left_umi_finger_l", "openarm_left_umi_finger_r", "openarm_left_gripper_body")
+
+
+def _right_offsets() -> Dict[str, np.ndarray]:
+    """link ごとの D_k = (M T_左,k M)^-1 T_右,k（URDF から。関節角によらない定数・grasp/urdf_fk.py の小さな FK で）。"""
+    global _D_RIGHT
+    if _D_RIGHT is None:
+        from grasp.arm import mirror_T, mirror_q
+        from grasp.urdf_fk import LeftArmFK
+        urdf = os.path.join(REPO, "urdf", "openarm_v10_bimanual.urdf")
+        L, R = LeftArmFK(urdf, "left"), LeftArmFK(urdf, "right")
+        q = np.array([0.2, -0.3, 0.4, 1.1, -0.3, 0.2, 0.5])
+        PL, PR = L.link_poses(q), R.link_poses(mirror_q(q))
+        _D_RIGHT = {f"openarm_left_link{k}": np.linalg.inv(mirror_T(PL[f"openarm_left_link{k}"])) @ PR[f"openarm_right_link{k}"]
+                    for k in range(8)}
+    return _D_RIGHT
+
+
+def right_local_center(link: str, c) -> np.ndarray:
+    """左の yml の球の中心 c（link の座標）→ 右腕用の中心（左の運動学で使い、付け根の座標で y 反転すると右腕の本当の位置になる）。"""
+    c = np.asarray(c, float)
+    if link in GRIPPER_LINKS:
+        return c
+    D = _right_offsets().get(link)
+    if D is None:
+        raise SystemExit(f"[curobo] 右腕の球の置き直し方を知らない link: {link}")
+    p = D[:3, :3] @ c + D[:3, 3]
+    return p * np.array([1.0, -1.0, 1.0])
+

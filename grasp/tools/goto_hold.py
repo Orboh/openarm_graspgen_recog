@@ -41,17 +41,15 @@ def main() -> int:
 
     from lerobot.robots.openarm_follower import OpenArmFollower, OpenArmFollowerConfig
     from lerobot.motors.damiao.damiao_alignment import soft_move_to_position
-    from lerobot.motors.damiao.openarm_gravity import OpenArmGravityModel
-    grav = OpenArmGravityModel(URDF, "left", 1.0).torque
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-    from grasp.soft_release import release_and_disconnect  # 2026-11-22 Sota: 力を抜くときはゆっくり（ダンプのように）
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))  # grasp/gravity.py を読む
+    from grasp.gravity import gravity_torque_fn
+    grav = gravity_torque_fn("left")  # 手と爪の質量入り（2026-11-23）
     robot = OpenArmFollower(OpenArmFollowerConfig(port=os.environ.get("GRASP_CAN_PORT", "can_fol_l"), side="left", id=os.environ.get("GRASP_ROBOT_ID", "follower_left"), align_on_connect=False, cameras={}))
     if os.path.exists(STOP):
         os.remove(STOP)
     stop = {"v": False}
     signal.signal(signal.SIGINT, lambda *_: stop.__setitem__("v", True))
-    from grasp.held_connect import connect_holding  # 11/22: robot.connect() turned torque off -> the held arm fell onto the cart
-    connect_holding(robot, grav)
+    robot.connect()
     obs = robot.get_observation(); start = {j: float(obs[f"{j}.pos"]) for j in J}
     print("[goto] start " + " ".join(f"{start[j]:+.1f}" for j in J), flush=True)
     try:
@@ -64,7 +62,7 @@ def main() -> int:
         print("[goto] returning to the start pose", flush=True)
         soft_move_to_position(robot.bus, start, torque_ff_fn=grav, max_speed_dps=a.speed_dps)
         time.sleep(0.3)
-        release_and_disconnect(robot, grav)
+        robot.disconnect()
         print("[goto] back at start, torque off", flush=True)
     return 0
 

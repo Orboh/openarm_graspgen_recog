@@ -5,3 +5,4 @@ grasp/runs
 *.bak
 *.bak-*.json
 grasp/runs_thor/
+*.pt

@@ -99,13 +99,15 @@ def main() -> int:
     ap.add_argument("--detector", choices=["aruco", "dark"], default="aruco")
     ap.add_argument("--marker-id", type=int, default=0,
                     help="ArUco（DICT_4X4_50）の番号。東京は 0、北九州の 2x2 の板は 24〜27 のどれか（2026-11-21）")
+    ap.add_argument("--arm", choices=["left", "right"], default="left",
+                    help="マーカーを付けた腕（2026-11-22: 右腕の運動学の確かめに、右で解いた結果を左の結果と比べる）")
     a = ap.parse_args()
     sys.path.insert(0, a.repo)
-    from ik.openarm_left_ik import OpenArmLeftIK
+    from ik.openarm_left_ik import OpenArmIK
 
     s = np.load(os.path.join(a.run_dir, "samples.npz"))
     Q, K = s["q_deg"], s["K"]
-    ik = OpenArmLeftIK(os.path.join(a.repo, "urdf", "openarm_v10_bimanual.urdf"))
+    ik = OpenArmIK(os.path.join(a.repo, "urdf", "openarm_v10_bimanual.urdf"), side=a.arm)
     T_l7, cands, imgs = [], [], []
     for k in range(len(Q)):
         M = ik.fk(np.deg2rad(Q[k])); T = np.eye(4); T[:3, :3] = M.rotation; T[:3, 3] = M.translation
@@ -146,7 +148,7 @@ def main() -> int:
     print(f"[handeye] camera position (base frame) = {np.round(x[3:6],3).tolist()}  box offset (link7) = {np.round(x[6:9],3).tolist()}")
 
     res = {"T_base_cam": T_bc.tolist(), "box_offset_link7_m": x[6:9].tolist(), "rms_m": rms,
-           "inliers": int(len(inl)), "frames": int(len(cands)), "run_dir": os.path.abspath(a.run_dir),
+           "inliers": int(len(inl)), "frames": int(len(cands)), "arm": a.arm, "run_dir": os.path.abspath(a.run_dir),
            "created": time.strftime("%Y-%m-%d %H:%M:%S"),
            "note": "base = root of urdf/openarm_v10_bimanual.urdf (ik/openarm_left_ik.py). cam = RealSense colour optical frame."}
     json.dump(res, open(os.path.join(a.run_dir, "T_base_cam.json"), "w"), indent=2)

@@ -1,30 +1,56 @@
 """cuRobo の当たり判定のサーバー（grasp/curobo/server.py）を呼ぶ。pyzmq と msgpack だけで動く（GraspGenX・lerobot の venv から）。
 
 GRASP_CUROBO（"host:port"）があれば使う。無ければ当たりを調べない（東京の既定）。
+右腕（GRASP_ARM=right）は GRASP_CUROBO_RIGHT のサーバー（server.py --arm right・既定 port 5559）に聞く（2026-11-22 Munenori）。
+右のサーバーが無いのに右腕で計画・実行するときは止まる（左のサーバーの答えを右腕に使わない）。
 """
 from __future__ import annotations
 
 import os
 from typing import Dict, List, Optional, Sequence, Tuple
 
-ADDR = os.environ.get("GRASP_CUROBO", "")
+def _addr_for(side: str) -> str:
+    if side == "right":
+        if os.environ.get("GRASP_CUROBO") and not os.environ.get("GRASP_CUROBO_RIGHT"):
+            raise SystemExit("[curobo] 右腕なのに GRASP_CUROBO_RIGHT が無い（左のサーバーで右腕の当たりを見ない）。"
+                             "server.py --arm right を立てて置き場の env に書く")
+        return os.environ.get("GRASP_CUROBO_RIGHT", "")
+    return os.environ.get("GRASP_CUROBO", "")
+
+
+ADDR = _addr_for(os.environ.get("GRASP_ARM", "left"))
+
+
+def set_arm(side: str) -> None:
+    """この後の問い合わせを side の腕のサーバーに向ける（plan.py の腕ごとの子のプロセス・run_grasp.py が呼ぶ）。"""
+    global ADDR
+    ADDR = _addr_for(side)
 # 箱との最小のすき間 [m]。机は指を除いた腕と手の本体で見る（爪の先と机は plan.py の床の確認がもっと細かく見る）
 MARGIN = float(os.environ.get("GRASP_CUROBO_MARGIN", "0.01"))
 TABLE_MARGIN = float(os.environ.get("GRASP_CUROBO_TABLE_MARGIN", "0.0"))
 
 
 def enabled() -> bool:
-    if ADDR and os.environ.get("GRASP_ARM", "left") != "left":
-        # the cuRobo arm model (openarm_left_umi) is the left arm only (2026-11-21 Tokyo: right arm via GRASP_ARM=right)
-        raise SystemExit("[curobo] GRASP_CUROBO は左腕のモデルだけ。GRASP_ARM=right では外す（unset GRASP_CUROBO）")
     return bool(ADDR)
+
+
+_CTX = (None, None)  # (pid, zmq.Context)
+
+
+def _context():
+    """このプロセスの ZMQ の context。fork した子（plan.py --arm both）は親の context を使えないので作り直す。"""
+    global _CTX
+    import zmq
+    if _CTX[0] != os.getpid():
+        _CTX = (os.getpid(), zmq.Context())
+    return _CTX[1]
 
 
 def _call(req: Dict, timeout_ms: int = 10000) -> Dict:
     import msgpack
     import zmq
     host, _, port = ADDR.partition(":")
-    sock = zmq.Context.instance().socket(zmq.REQ)
+    sock = _context().socket(zmq.REQ)
     sock.setsockopt(zmq.RCVTIMEO, timeout_ms); sock.setsockopt(zmq.LINGER, 0)
     sock.connect(f"tcp://{host or 'localhost'}:{port or '5558'}")
     try:
@@ -83,6 +109,15 @@ def detour(q_from: Sequence[float], q_to: Sequence[float], table_margin: Optiona
     return rep.get("vias")
 
 
+def plan_grasp(q_start_deg: Sequence[float], T_grasp, approach: float = 0.10, lift: float = 0.10,
+               target: Optional[Dict] = None) -> Dict:
+    """cuRobo の plan_grasp（近づく・差し込む・持ち上げるの細かい軌道 [deg]）。target は拾う物の箱（近づく区間だけよける）。
+    返り値 {"success", "status", "approach", "grasp", "lift"}。初回は CUDA graph を作るので時間がかかる。"""
+    return _call({"op": "plan_grasp", "q_start_deg": [float(v) for v in q_start_deg],
+                  "T_grasp": [[float(v) for v in row] for row in T_grasp], "approach": float(approach), "lift": float(lift),
+                  "target": target}, timeout_ms=180000)
+
+
 def set_obstacle_points(points, arm_q_deg: Sequence[Sequence[float]], cam_pos: Sequence[float], floor_z: float,
                         arm_margin: float = 0.03, exclude: Sequence[Sequence[float]] = (), **box_kw) -> Dict:
     """カメラで見た点（腕の付け根の座標・机より上・掴む物を除いた物）から障害物の箱を作ってサーバーに入れる。
@@ -100,3 +135,18 @@ def set_obstacle_points(points, arm_q_deg: Sequence[Sequence[float]], cam_pos: S
 def set_obstacle_boxes(boxes: List[Dict]) -> None:
     """障害物の箱をそのまま入れ替える（記録の obstacles.json を送り直す・空なら障害物なし）。"""
     _call({"op": "set_boxes", "boxes": boxes}, timeout_ms=30000)
+
+
+def ik(T_link7, seed_deg=None, return_seeds: int = 4, lm_only: bool = False):
+    """link7 の姿勢 (N, 4, 4) を cuRobo の IK でまとめて解く → (関節角 (N, k, 7) [deg], 成功 (N, k))。
+    周りの物・カメラで見た障害物・もう片方の腕・自己干渉に当たる解は成功にならない（grasp/curobo/ik.py）。"""
+    import numpy as np
+    T = np.asarray(T_link7, float).reshape(-1, 4, 4)
+    rep = _call({"op": "ik", "T": T.tolist(), "seed_deg": None if seed_deg is None else np.asarray(seed_deg, float).tolist(),
+                 "return_seeds": int(return_seeds), **({"lm_only": True} if lm_only else {})}, timeout_ms=60000)
+    return np.asarray(rep["q_deg"], float), np.asarray(rep["ok"], bool)
+
+
+def set_other_arm(q_deg: Optional[Sequence[float]]) -> None:
+    """休んでいるもう片方の腕の姿勢（lerobot の度）を入れ替える。None で外す。起動時はもう片方の休みの姿勢が入っている。"""
+    _call({"op": "set_other_arm", "q_deg": None if q_deg is None else [float(v) for v in q_deg]}, timeout_ms=30000)

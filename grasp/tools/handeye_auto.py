@@ -53,7 +53,6 @@ def main() -> int:
 
     from lerobot.robots.openarm_follower import OpenArmFollower, OpenArmFollowerConfig
     from lerobot.motors.damiao.damiao_alignment import soft_move_to_position
-    from lerobot.motors.damiao.openarm_gravity import OpenArmGravityModel
 
     cfg = OpenArmFollowerConfig(port=a.port, side="left", id=os.environ.get("GRASP_ROBOT_ID", "follower_left"), align_on_connect=False, cameras={})
     robot = OpenArmFollower(cfg)
@@ -80,18 +79,15 @@ def main() -> int:
     for _ in range(30):
         pipe.wait_for_frames()
 
-    grav = OpenArmGravityModel(URDF, "left", 1.0).torque
-
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-
-    from grasp.soft_release import release_and_disconnect  # 2026-11-22 Sota: 力を抜くときはゆっくり（ダンプのように）
-    from grasp.held_connect import connect_holding  # 11/22: robot.connect() turned torque off -> the held arm fell onto the cart
-    connect_holding(robot, grav)
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))  # grasp/gravity.py を読む
+    from grasp.gravity import gravity_torque_fn
+    grav = gravity_torque_fn("left")  # 手と爪の質量入り（2026-11-23）
+    robot.connect()
     obs = robot.get_observation()
     start = {j: float(obs[f"{j}.pos"]) for j in J}
     for i, j in enumerate(J):  # don't move if the start pose itself is outside the limits
         if not (LO[i] < start[j] < HI[i]):
-            release_and_disconnect(robot, grav); pipe.stop()
+            robot.disconnect(); pipe.stop()
             raise SystemExit(f"[auto] start pose {j}={start[j]:.1f} is outside the limits [{LO[i]:.0f},{HI[i]:.0f}]. Stopping")
     print("[auto] start pose " + " ".join(f"{start[j]:+.1f}" for j in J), flush=True)
     qs, K = [], None
@@ -126,7 +122,7 @@ def main() -> int:
             move(start)
             time.sleep(0.5)
         finally:
-            release_and_disconnect(robot, grav); pipe.stop()
+            robot.disconnect(); pipe.stop()
             print(f"[auto] back at start, torque off. {len(qs)} samples -> {out}", flush=True)
     return 0
 

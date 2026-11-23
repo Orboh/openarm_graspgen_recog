@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Step 2: cut out only the object from the scene point cloud (RANSAC plane removal → DBSCAN → largest cluster).
 
-No recognition (YOLO etc.) is used. Assumes one object on the table.
+No recognition (YOLO etc.) is used by default. Assumes one object on the table, unless a registered target is
+picked (grasp/objects.py: colour and size of each cluster; thor_snap --target <name>), or YOLOE-26 + SigLIP2 is
+used instead (thor_snap --yoloe; segment_object_frames below).
 
 Usage (works offline on a saved capture):
     python grasp/segment.py grasp/runs/cap_xxx            # → writes object.ply next to it
@@ -12,7 +14,7 @@ from __future__ import annotations
 import argparse
 import os
 from dataclasses import dataclass
-from ultralytics import YOLOE
+
 import numpy as np
 
 
@@ -31,12 +33,15 @@ class SegParams:
     sor_std: float = 2.0
 
 
-def segment_largest_object(pts: np.ndarray, p: SegParams = SegParams(), return_debug: bool = False):
-    """pts (N,3) camera frame → object point cloud (M,3). Raises RuntimeError on failure.
+def segment_clusters(pts: np.ndarray, p: SegParams = SegParams()):
+    """pts (N,3) camera frame → (clusters, debug). clusters: list of (M,3) above the table, largest first,
+    each with at least min_cluster_pts points (before outlier removal). Raises RuntimeError on failure.
 
     debug: plane model (a,b,c,d; normal oriented toward the camera side), cluster sizes.
+    Used by segment_largest_object and by grasp.objects to pick a named target (2026-11-22).
     """
     import open3d as o3d
+
     pts = pts[np.isfinite(pts).all(1) & (pts[:, 2] > 0) & (pts[:, 2] < p.zmax)]
     pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts.astype(np.float64)))
     pc = pc.voxel_down_sample(p.voxel)
@@ -60,24 +65,36 @@ def segment_largest_object(pts: np.ndarray, p: SegParams = SegParams(), return_d
     if labels.max() < 0:
         raise RuntimeError("DBSCAN found no cluster")
     sizes = np.bincount(labels[labels >= 0])
-    best = int(np.argmax(sizes))
-    if sizes[best] < p.min_cluster_pts:
-        raise RuntimeError(f"largest cluster too small ({sizes[best]})")
-    cl = obj_pc.select_by_index(np.where(labels == best)[0])
-    cl, _ = cl.remove_statistical_outlier(p.sor_nb, p.sor_std)
-    out = np.asarray(cl.points, dtype=np.float32)
-    if return_debug:
-        return out, {"plane": [*n.tolist(), float(d)], "plane_inliers": len(inl),
-                     "cluster_sizes": sorted(sizes.tolist(), reverse=True)[:5]}
-    return out
+    order = [int(i) for i in np.argsort(-sizes, kind="stable") if sizes[i] >= p.min_cluster_pts]
+    if not order:
+        raise RuntimeError(f"largest cluster too small ({sizes.max()})")
+    clusters = []
+    for i in order:
+        cl = obj_pc.select_by_index(np.where(labels == i)[0])
+        cl, _ = cl.remove_statistical_outlier(p.sor_nb, p.sor_std)
+        clusters.append(np.asarray(cl.points, dtype=np.float32))
+    dbg = {"plane": [*n.tolist(), float(d)], "plane_inliers": len(inl),
+           "cluster_sizes": sorted(sizes.tolist(), reverse=True)[:5]}
+    return clusters, dbg
+
+
+def segment_largest_object(pts: np.ndarray, p: SegParams = SegParams(), return_debug: bool = False):
+    """pts (N,3) camera frame → object point cloud (M,3) = the largest cluster. Raises RuntimeError on failure."""
+    clusters, dbg = segment_clusters(pts, p)
+    return (clusters[0], dbg) if return_debug else clusters[0]
+
 
 def segment_object_frames(cap_dir: str, p: SegParams = SegParams(), return_debug: bool = False):
+    """cap_dir's color.png → YOLOE-26 prompt-free instance masks (list[ultralytics.engine.results.Results]).
+    Used by thor_snap.py's --yoloe / pick_target, which classifies only the winning mask's material afterward."""
+    from ultralytics import YOLOE
     model = YOLOE("yoloe-26l-seg-pf.pt")
     color_path = os.path.join(cap_dir, "color.png")
     segmented_objects = model.predict(source=color_path, save=True, save_txt=True, conf=0.25, device="cuda", project=cap_dir, name="segmentation")
     r = segmented_objects[0]
     print(f"masks found: {0 if r.masks is None else len(r.masks.data)}")
     return segmented_objects
+
 
 def main():
     import open3d as o3d
@@ -91,7 +108,6 @@ def main():
     scene = o3d.io.read_point_cloud(os.path.join(a.cap_dir, "scene.ply"))
     p = SegParams(plane_dist=a.plane_dist, dbscan_eps=a.eps)
     obj, dbg = segment_largest_object(np.asarray(scene.points), p, return_debug=True)
-    obj_seg=segment_object_frames(a.cap_dir, p, return_debug=True)
     out = os.path.join(a.cap_dir, "object.ply")
     o3d.io.write_point_cloud(out, o3d.geometry.PointCloud(o3d.utility.Vector3dVector(obj.astype(np.float64))))
     ext = obj.max(0) - obj.min(0)

@@ -22,6 +22,20 @@ grasp/curobo/client.py で呼ぶ。周りの物は起動時に GRASP_WORLD_YML �
       → {"boxes": [...], "n_in", "n_after_arm"}。カメラで見た点（机より上・掴む物を除いた物）から、撮影時の腕のまわりを消し、
       塊ごとの箱（grasp/curobo/obstacles.py）にして、置き場の箱に足す（前の障害物は入れ替える）
   {"op": "set_boxes", "boxes": [...]} → 障害物の箱をそのまま入れ替える（run_grasp.py が記録の obstacles.json を送り直す）
+  {"op": "ik", "T": [[4x4], ...], "seed_deg": [[..7], ...] か None, "return_seeds": 4}
+      → {"q_deg": [[[..7] x k] x N], "ok": [[bool x k] x N]}。link7 の姿勢（その腕の付け根の座標）を cuRobo の IK でまとめて解く
+      （周りの物・カメラで見た障害物・もう片方の腕・自己干渉を見る・grasp/curobo/ik.py）。--no-ik で立てると使えない
+  {"op": "plan_grasp", "q_start_deg": [..7], "T_grasp": [[4x4]], "approach": 0.10, "lift": 0.10, "target": 箱 か None}
+      → {"success", "status", "approach", "grasp", "lift"}（軌道は [[..7], ...] の細かい点か None）。cuRobo の
+      MotionPlanner.plan_grasp（近づく区間は拾う物の箱もよける・差し込みと持ち上げは手先の直線で、爪と手のひらだけ当たりを見ない）。
+      T_grasp は掴む姿勢の link7（その腕の付け根の座標）。2026-11-23 Munenori
+  {"op": "set_other_arm", "q_deg": [..7] か None} → 休んでいるもう片方の腕の姿勢を入れ替える（None で外す）。
+      起動時はもう片方の休みの姿勢（左のサーバーは GRASP_REST_RIGHT・右は GRASP_REST）。無ければ入れない（片腕の置き場）
+
+右腕（2026-11-22 Munenori）: --arm right（既定 port 5559）で立てると、関節角は右腕の lerobot の度で受け、左のモデルを鏡に写して
+答える（model.MirroredArm・planner.MirroredPlanner）。link の名前は左と同じ "link4" などで返す。左右のサーバーを 1 つずつ立てる:
+    ~/work/curobo/.venv/bin/python grasp/curobo/server.py                 # 左（5558）
+    ~/work/curobo/.venv/bin/python grasp/curobo/server.py --arm right     # 右（5559）
 """
 from __future__ import annotations
 
@@ -34,7 +48,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 from grasp.curobo.client import violations_from  # noqa: E402
-from grasp.curobo.model import ArmSpheres, MeshDistance, load_world, obstacle_distances  # noqa: E402
+from grasp.curobo.model import ArmSpheres, MeshDistance, MirroredArm, load_world, obstacle_distances, other_arm_obstacle  # noqa: E402
 
 
 def check_path(arm: ArmSpheres, world, meshes, waypoints_deg, n: int):
@@ -124,27 +138,42 @@ def set_points(arm: ArmSpheres, req) -> tuple:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", type=int, default=int(os.environ.get("GRASP_CUROBO_PORT", "5558")))
+    ap.add_argument("--arm", choices=["left", "right"], default="left", help="どちらの腕の当たりを見るか（右は左のモデルの鏡写し）")
+    ap.add_argument("--port", type=int, default=None, help="既定: 左 GRASP_CUROBO_PORT か 5558・右 5559")
     ap.add_argument("--world", default=None, help="置き場の箱の YAML（無ければ GRASP_WORLD_YML）")
+    ap.add_argument("--no-ik", action="store_true", help="cuRobo の IK（plan.py の掴み方の IK）を作らない（GPU のメモリを節約）")
     ap.add_argument("--no-detour", action="store_true", help="回り込む経路（cuRobo の MotionPlanner）を作らない（起動が速い・GPU を使わない）")
     a = ap.parse_args()
     import msgpack
     import zmq
-    arm = ArmSpheres()
+    if a.port is None:
+        a.port = int(os.environ.get("GRASP_CUROBO_PORT", "5558")) if a.arm == "left" else 5559
+    arm = ArmSpheres() if a.arm == "left" else MirroredArm(ArmSpheres(side="right"))
     world = load_world(a.world)
     base_cuboids = list(world["cuboid"])  # 置き場の箱。カメラで見た障害物（seen_*）はこの後ろに足し、要求ごとに入れ替える
     meshes = [MeshDistance(m) for m in world["mesh"]]
-    names = [c["name"] for c in world["cuboid"]] + [m.name for m in meshes]
+    other_q = os.environ.get("GRASP_REST" if a.arm == "right" else "GRASP_REST_RIGHT")
+    oa = other_arm_obstacle(a.arm, [float(v) for v in other_q.split(",")] if other_q else None)
+    world["spheres"] = [oa] if oa else []
+    print(f"[curobo] もう片方の腕: " + (f"{oa['arm']} 腕を休みの姿勢 {oa['q_deg']} で入れた（球 {len(oa['spheres'])} 個・箱 {len(oa['boxes'])} 個）"
+                                    if oa else "入れない（休みの姿勢の env が無い）"), flush=True)
+    names = [c["name"] for c in world["cuboid"]] + [m.name for m in meshes] + [sg["name"] for sg in world["spheres"]]
     check_path(arm, world, meshes, [[0] * 7, [10] * 7], 30)  # 温める（初回の Warp のコンパイル）
     planner, planner_dirty = None, False
     if not a.no_detour:
-        from grasp.curobo.planner import DetourPlanner
+        from grasp.curobo.planner import DetourPlanner, MirroredPlanner
         t0 = time.time()
-        planner = DetourPlanner(world)
+        planner = DetourPlanner(world) if a.arm == "left" else MirroredPlanner(world)
         print(f"[curobo] 回り込みの MotionPlanner を作って温めた（{time.time() - t0:.0f} 秒）", flush=True)
+    gik, gik_dirty = None, False
+    if not a.no_ik:
+        from grasp.curobo.ik import GraspIK
+        t0 = time.time()
+        gik = GraspIK(world, side=a.arm)
+        print(f"[curobo] IK を作って温めた（{time.time() - t0:.0f} 秒）", flush=True)
     sock = zmq.Context().socket(zmq.REP)
     sock.bind(f"tcp://*:{a.port}")
-    print(f"[curobo] 箱 {names}・球 {len(arm.sphere_links)} 個。:{a.port} で待つ", flush=True)
+    print(f"[curobo] {a.arm} 腕・箱 {names}・球 {len(arm.sphere_links)} 個。:{a.port} で待つ", flush=True)
     while True:
         req = msgpack.unpackb(sock.recv(), raw=False)
         try:
@@ -163,13 +192,30 @@ def main() -> int:
                 else:
                     boxes, info = list(req.get("boxes") or []), {}
                 world["cuboid"] = base_cuboids + boxes
-                planner_dirty = True  # 経路計画の障害物は、回り込みを作るときに入れ替える（毎フレームだと重い）
-                names = [c["name"] for c in world["cuboid"]] + [m.name for m in meshes]
+                planner_dirty = gik_dirty = True  # 経路計画の障害物は、回り込みを作るときに入れ替える（毎フレームだと重い）
+                names = [c["name"] for c in world["cuboid"]] + [m.name for m in meshes] + [sg["name"] for sg in world["spheres"]]
                 rep = {"boxes": boxes, **info}
                 if not req.get("quiet"):
                     print(f"[curobo] {op}: 障害物の箱 {len(boxes)} 個 " + " ".join(
                         f"{b['name']}(中心 {np.round(b['pose'][:3], 2).tolist()}・大きさ {np.round(b['dims'], 2).tolist()})" for b in boxes)
                         + (f"（点 {info['n_in']} → 腕を消して {info['n_after_arm']}）" if info else ""), flush=True)
+            elif op == "set_other_arm":
+                oa = other_arm_obstacle(a.arm, req.get("q_deg"))
+                world["spheres"] = [oa] if oa else []
+                planner_dirty = gik_dirty = True
+                names = [c["name"] for c in world["cuboid"]] + [m.name for m in meshes] + [sg["name"] for sg in world["spheres"]]
+                rep = {"other_arm": None if oa is None else oa["q_deg"]}
+                print(f"[curobo] set_other_arm: {rep['other_arm']}", flush=True)
+            elif op == "ik":
+                if gik is None:
+                    raise RuntimeError("サーバーを --no-ik で立てている")
+                if gik_dirty:
+                    gik.update_world(world)
+                    gik_dirty = False
+                Q, OK = gik.solve(np.asarray(req["T"], float), req.get("seed_deg"), int(req.get("return_seeds", 4)),
+                                  lm_only=bool(req.get("lm_only", False)))
+                rep = {"q_deg": Q.tolist(), "ok": OK.tolist()}
+                print(f"[curobo] ik {len(Q)} 個・解けた {int(OK.any(1).sum())} 個（{time.time()-t0:.2f} 秒）", flush=True)
             elif op == "detour":
                 if planner is not None and planner_dirty:
                     planner.update_world(world)
@@ -177,6 +223,18 @@ def main() -> int:
                 rep = detour(arm, world, meshes, planner, req)
                 print("[curobo] detour: " + (f"経由点 {len(rep['vias'])} 個" if rep.get("vias") else f"作れない（{rep.get('why')}）")
                       + f"（{time.time()-t0:.2f} 秒）", flush=True)
+            elif op == "plan_grasp":
+                if planner is None:
+                    raise RuntimeError("サーバーを --no-detour で立てている（plan_grasp には MotionPlanner が要る）")
+                # 拾う物の箱をこの計画の間だけ足す（次の detour の前に入れ替える）
+                tb = req.get("target")
+                planner.update_world(dict(world, cuboid=world["cuboid"] + ([tb] if tb else [])))
+                planner_dirty = True
+                rep = planner.plan_grasp(req["q_start_deg"], req["T_grasp"], float(req.get("approach", 0.10)),
+                                         float(req.get("lift", 0.10)))
+                print(f"[curobo] plan_grasp: {rep['status']}・点の数 " + "・".join(
+                    f"{ph} {len(rep[ph]) if rep[ph] else '—'}" for ph in ("approach", "grasp", "lift"))
+                    + f"（拾う物の箱 {'あり' if tb else 'なし'}・{time.time()-t0:.2f} 秒）", flush=True)
             else:
                 rep = {"error": f"知らない op: {op}"}
         except Exception as e:  # 1 つの悪い要求でサーバーを落とさない

@@ -267,9 +267,10 @@ def link7_pose(q_deg) -> np.ndarray:
     """link7 の 4x4（腕の付け根の座標）。Pinocchio を使わず URDF の小さな FK（grasp/urdf_fk.py）で。"""
     from grasp.urdf_fk import LeftArmFK
     global _FK
-    if _FK is None:
-        _FK = LeftArmFK()
-    return _FK.link_poses(np.deg2rad(q_deg))["openarm_left_link7"]
+    side = os.environ.get("GRASP_ARM", "left")  # run_grasp.py が plan.json の腕を入れる（2026-11-22）
+    if _FK is None or _FK.side != side:
+        _FK = LeftArmFK(side=side)
+    return _FK.link_poses(np.deg2rad(q_deg))[f"openarm_{side}_link7"]
 
 
 def held_in_link7(obj_base: np.ndarray, q_grasp_deg) -> np.ndarray:

@@ -26,11 +26,17 @@ def scene_dict(world: Dict) -> Dict:
     import trimesh
     from grasp.curobo.model import _quat_wxyz_to_R
     sc = {"cuboid": {c["name"]: {"dims": c["dims"], "pose": c["pose"]} for c in world["cuboid"]}, "mesh": {}}
+    for sg in world.get("spheres") or []:  # 休んでいるもう片方の腕は link ごとの外接の箱で（model.other_arm_obstacle）
+        for b in sg.get("boxes", []):
+            sc["cuboid"][b["name"]] = {"dims": b["dims"], "pose": b["pose"]}
     for m in world["mesh"]:
         tm = trimesh.load(m["file"], force="mesh")
         tm.apply_scale(m["scale"])
         T = np.eye(4); T[:3, :3] = _quat_wxyz_to_R(m["pose"][3:7]); T[:3, 3] = m["pose"][:3]
         tm.apply_transform(T)
+        if m.get("mirror"):  # 右腕の経路を左のモデルで解くとき（model.mirror_world）: y を反転し、面の向きを裏返して外向きに保つ
+            tm.vertices[:, 1] *= -1.0
+            tm.faces = tm.faces[:, ::-1]
         sc["mesh"][m["name"]] = {"vertices": tm.vertices.tolist(), "faces": tm.faces.ravel().tolist(),
                                  "pose": [0, 0, 0, 1, 0, 0, 0]}
     return sc
@@ -39,12 +45,12 @@ def scene_dict(world: Dict) -> Dict:
 class DetourPlanner:
     """回り込む経路を作る。作るのと温めるのに時間がかかるので、サーバーで 1 度だけ作る。"""
 
-    def __init__(self, world: Dict):
+    def __init__(self, world: Dict, side: str = "left"):
         import torch
         from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
         self.torch = torch
         cfg = MotionPlannerCfg.create(
-            robot=robot_cfg_dict(), scene_model=scene_dict(world), collision_cache={"cuboid": 24, "mesh": 2},  # 置き場の箱 + カメラで見た障害物（obstacles.MAX_BOXES）
+            robot=robot_cfg_dict(side), scene_model=scene_dict(world), collision_cache={"cuboid": 40, "mesh": 2},  # 置き場の箱 + カメラで見た障害物（obstacles.MAX_BOXES）+ もう片方の腕の link の箱
             use_cuda_graph=True, graph_planner_algorithm="rrt", optimizer_collision_activation_distance=PLAN_ACTIVATION,
         )
         self.mp = MotionPlanner(cfg)
@@ -57,17 +63,49 @@ class DetourPlanner:
         from curobo.scene import Scene
         self.mp.update_world(Scene.create(scene_dict(world)))
 
+    def _js(self, qd):
+        """関節 1〜7 [deg] → cuRobo の JointState（指は lock_joints の開いた値）。"""
+        from curobo.types import JointState
+        full = self.torch.zeros((1, len(self.joint_names)), device="cuda:0", dtype=self.torch.float32)
+        for k, j in enumerate(ARM_JOINTS):
+            full[0, self.joint_names.index(j)] = float(np.deg2rad(qd[k]))
+        return JointState.from_position(full, joint_names=self.joint_names)
+
+    def plan_grasp(self, q_start_deg, T_grasp, approach: float = 0.10, lift: float = 0.10) -> Dict:
+        """cuRobo の MotionPlanner.plan_grasp で、近づく → 差し込む → 持ち上げるの細かい軌道を作る（2026-11-23 Munenori）。
+
+        - 近づく（q_start → 掴む姿勢から link7 の -z へ approach 戻した所）: 周りの物と拾う物（呼ぶ前に world に入れておく）を
+          全部よける。爪も当たりを見る
+        - 差し込む（→ 掴む姿勢）・持ち上げる（→ 真上へ lift）: 手先の直線に沿う。爪と手のひら（GRIPPER_LINKS）だけ当たりを見ない
+        返り値 {"success", "status", "approach", "grasp", "lift"}。軌道は (M, 7) [deg] の list か None。"""
+        from curobo.types import GoalToolPose, Pose
+        from grasp.curobo.ik import _quat_wxyz
+        from grasp.curobo.model import GRIPPER_LINKS
+        torch = self.torch
+        T = np.asarray(T_grasp, float).reshape(4, 4)
+        pos = torch.tensor(T[None, :3, 3], device="cuda:0", dtype=torch.float32)
+        quat = torch.tensor(_quat_wxyz(T[None, :3, :3]), device="cuda:0", dtype=torch.float32)
+        goal = GoalToolPose.from_poses({self.mp.tool_frames[0]: Pose(position=pos, quaternion=quat)}, num_goalset=1)
+        r = self.mp.plan_grasp(goal, self._js(q_start_deg), grasp_approach_axis="z", grasp_approach_offset=-float(approach),
+                               grasp_approach_in_tool_frame=True, grasp_lift_axis="z", grasp_lift_offset=float(lift),
+                               grasp_lift_in_tool_frame=False, plan_grasp_to_lift=lift > 0,
+                               disable_collision_links=list(GRIPPER_LINKS))
+        out = {"success": bool(r.success is not None and bool(r.success.any())), "status": str(r.status),
+               "approach": None, "grasp": None, "lift": None}
+        for ph in ("approach", "grasp", "lift"):
+            tr, last = getattr(r, f"{ph}_interpolated_trajectory"), getattr(r, f"{ph}_interpolated_last_tstep")
+            if tr is None or not bool(getattr(r, f"{ph}_success").any()):
+                continue
+            names = list(tr.joint_names)
+            P = tr.position.reshape(-1, tr.position.shape[-2], len(names))[0]
+            if last is not None:
+                P = P[: int(last.view(-1)[0].item()) + 1]
+            out[ph] = np.rad2deg(P.detach().cpu().numpy()[:, [names.index(j) for j in ARM_JOINTS]]).tolist()
+        return out
+
     def dense(self, q0_deg, q1_deg, max_attempts: int = 4) -> Optional[np.ndarray]:
         """cuRobo の経路（(M, 7) [deg]・関節 1〜7）。作れなければ None。"""
-        from curobo.types import JointState
-        torch = self.torch
-
-        def js(qd):
-            full = torch.zeros((1, len(self.joint_names)), device="cuda:0", dtype=torch.float32)
-            for k, j in enumerate(ARM_JOINTS):
-                full[0, self.joint_names.index(j)] = float(np.deg2rad(qd[k]))
-            return JointState.from_position(full, joint_names=self.joint_names)
-
+        js = self._js
         res = self.mp.plan_cspace(js(q1_deg), js(q0_deg), max_attempts=max_attempts, enable_graph_attempt=0)
         if res is None or not bool(res.success.any()):
             return None
@@ -75,6 +113,32 @@ class DetourPlanner:
         names = list(tr.joint_names)
         P = tr.position.reshape(-1, len(names)).detach().cpu().numpy()
         return np.rad2deg(P[:, [names.index(j) for j in ARM_JOINTS]])
+
+
+class MirroredPlanner:
+    """右腕の回り込み: 周りの物を鏡に写して左の DetourPlanner で解き、経路の関節角を右に戻す。"""
+
+    def __init__(self, world: Dict):
+        from grasp.curobo.model import mirror_world
+        self._mw = mirror_world
+        self.inner = DetourPlanner(mirror_world(world), side="right")
+
+    def update_world(self, world: Dict) -> None:
+        self.inner.update_world(self._mw(world))
+
+    def plan_grasp(self, q_start_deg, T_grasp, approach: float = 0.10, lift: float = 0.10) -> Dict:
+        """右腕: 掴む姿勢と始めの角度を左に写して解き、軌道を右に戻す（周りの物は update_world で写してある）。"""
+        from grasp.arm import mirror_q, mirror_T
+        out = self.inner.plan_grasp(mirror_q(q_start_deg), mirror_T(np.asarray(T_grasp, float).reshape(1, 4, 4))[0], approach, lift)
+        for ph in ("approach", "grasp", "lift"):
+            if out[ph] is not None:
+                out[ph] = np.asarray(mirror_q(np.asarray(out[ph], float))).tolist()
+        return out
+
+    def dense(self, q0_deg, q1_deg, max_attempts: int = 4) -> Optional[np.ndarray]:
+        from grasp.arm import mirror_q
+        P = self.inner.dense(mirror_q(q0_deg), mirror_q(q1_deg), max_attempts)
+        return None if P is None else mirror_q(P)
 
 
 def shortcut(path_deg: np.ndarray, seg_ok: Callable[[np.ndarray, np.ndarray], bool]) -> Optional[List[List[float]]]:

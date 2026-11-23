@@ -73,10 +73,7 @@ def next_iter_dir():
 
 def track_key(source, t_base_cam_path):
     """Iterations are compared only within one track: same scenes, same hand-eye, same verifier."""
-    hp = t_base_cam_path or "no-handeye"
-    if "/grasp/config/" in hp:  # 2026-11-21: repo-relative, so moving the code (openarm-orboh -> openarm-grasp) keeps the track
-        hp = "grasp/config/" + hp.split("/grasp/config/", 1)[1]
-    return f"{source}|{hp}|{contract.VERIFIER_VERSION}"
+    return f"{source}|{t_base_cam_path or 'no-handeye'}|{contract.VERIFIER_VERSION}"
 
 
 def best_record(source=None, t_base_cam_path=None):
@@ -159,15 +156,23 @@ def load_scene(d):
 
 
 # ---------------------------------------------------------------- plan level (optional, offline IK)
-def ik_check(G_cam, T_base_cam):
+def ik_check(G_cam, T_base_cam, side=None):
     """Grasp (camera frame, base=flange) -> link7 target in arm base -> numeric IK on urdf_fk.
-    Returns {"converged", "pos_err_m", "rot_err_deg"}. Pure numpy/scipy; no motion."""
+    Returns {"converged", "pos_err_m", "rot_err_deg"}. Pure numpy/scipy; no motion.
+    腕（2026-11-22 Munenori）: side が無ければ GRASP_ARM（both なら左右とも解いて誤差の小さい方。結果に "arm" を入れる）。"""
+    if side is None:
+        env_arm = os.environ.get("GRASP_ARM", "left")
+        sides = ["left", "right"] if env_arm == "both" else [env_arm]
+        res = [ik_check(G_cam, T_base_cam, sd) for sd in sides]
+        return min(res, key=lambda r: r["pos_err_m"] + r["rot_err_deg"] / 1000)
     from scipy.optimize import least_squares
     from scipy.spatial.transform import Rotation as R
     from grasp.urdf_fk import LeftArmFK
 
-    fk = getattr(ik_check, "_fk", None) or LeftArmFK()
-    ik_check._fk = fk
+    cache = getattr(ik_check, "_fks", {})
+    fk = cache.get(side) or LeftArmFK(side=side)
+    cache[side] = fk
+    ik_check._fks = cache
     lim = []
     for j in fk.chain:
         if j.get("type") == "revolute":
@@ -181,24 +186,30 @@ def ik_check(G_cam, T_base_cam):
         T = T_base_cam @ G_cam @ Rz @ np.linalg.inv(flange)
 
         def res(q):
-            P = fk.link_poses(q)["openarm_left_link7"]
+            P = fk.link_poses(q)[f"openarm_{side}_link7"]
             dp = P[:3, 3] - T[:3, 3]
             dr = R.from_matrix(T[:3, :3].T @ P[:3, :3]).as_rotvec() * 0.1  # 10 cm per rad
             return np.r_[dp, dr]
 
-        for seed in (np.zeros(7), np.deg2rad([-30, 0, 30, 60, 0, 0, 0])):
+        seed2 = np.array([-30, 0, 30, 60, 0, 0, 0], float)
+        if side == "right":  # 左の種を鏡に写す（grasp/arm.py）
+            from grasp.arm import mirror_q
+            seed2 = mirror_q(seed2)
+        for seed in (np.zeros(7), np.deg2rad(seed2)):
             r = least_squares(res, np.clip(seed, lo + 1e-3, hi - 1e-3), bounds=(lo, hi), max_nfev=300)
             pe = float(np.linalg.norm(r.fun[:3])); re = float(np.degrees(np.linalg.norm(r.fun[3:]) / 0.1))
             if best is None or pe + re / 1000 < best["pos_err_m"] + best["rot_err_deg"] / 1000:
                 best = {"pos_err_m": pe, "rot_err_deg": re, "q_deg": np.degrees(r.x).round(1).tolist()}
     best["converged"] = best["pos_err_m"] < 0.005 and best["rot_err_deg"] < 3.0
+    best["arm"] = side
     return best
 
 
 # ---------------------------------------------------------------- one trial
 def run_trial(name, d, p, tdir, T_base_cam=None):
     from grasp.capture import depth_to_points
-    from grasp.segment import SegParams, segment_largest_object
+    from grasp.segment import SegParams, segment_clusters
+    from grasp import objects
     from grasp.infer import infer_grasps, load_sweep
 
     os.makedirs(tdir, exist_ok=True)
@@ -207,13 +218,25 @@ def run_trial(name, d, p, tdir, T_base_cam=None):
     depth, K, color = load_scene(d)
     (v0, v1), (u0, u1) = p["rows"], p["cols"]
     dm = np.zeros_like(depth); dm[v0:v1, u0:u1] = depth[v0:v1, u0:u1]
+    spec = objects.load(p["target"]) if p.get("target") else None
+    if spec is not None and color is None:
+        raise SystemExit(f"[loop] --target {spec['name']} には色の画像が要る（{d}）")
+    if spec is not None and spec["separate_from"]:
+        dm[objects.separate_mask(color, spec)] = 0
     pts, _ = depth_to_points(dm, K, zmin=p["zmin"], zmax=p["zmax"])
     sp = SegParams(voxel=p["voxel"], zmax=p["zmax"], plane_dist=p["plane_dist"],
                    above_plane_min=p["above_plane_min"], above_plane_max=p["above_plane_max"],
                    dbscan_eps=p["dbscan_eps"], dbscan_min_pts=p["dbscan_min_pts"],
                    min_cluster_pts=p["min_cluster_pts"])
     try:
-        obj, dbg = segment_largest_object(pts, sp, return_debug=True)
+        clusters, dbg = segment_clusters(pts, sp)
+        best = 0
+        if spec is not None:
+            best, table = objects.pick(clusters, K, color, spec, plane=dbg.get("plane"))
+            info["target"] = {"name": spec["name"], "picked": best, "clusters": table}
+            if best is None:
+                raise RuntimeError(objects.not_found(spec, table))
+        obj = clusters[best]
         obs["obj"], obs["plane"] = obj, dbg["plane"]
         info["seg"] = {"pts": len(obj), "extent_m": np.ptp(obj, 0).round(3).tolist(), **dbg}
     except RuntimeError as e:

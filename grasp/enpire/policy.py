@@ -18,6 +18,8 @@ GRASP = os.path.dirname(HERE)
 DEFAULT_PARAMS = {
     # ROI on the chest camera image (cuts the robot's own hands at the bottom) and depth window
     "rows": [0, 480], "cols": [0, 640], "zmin": 0.30, "zmax": 0.70,
+    # 拾う物の名前（grasp/config/objects/<名前>.json・2026-11-22）。None ならいちばん大きいかたまり
+    "target": None,
     # segment.SegParams
     "voxel": 0.004, "plane_dist": 0.008, "above_plane_min": 0.010, "above_plane_max": 0.04,
     "dbscan_eps": 0.015, "dbscan_min_pts": 30, "min_cluster_pts": 150,

@@ -38,18 +38,16 @@ def main() -> int:
     ap.add_argument("--poses", default=None, help="JSON from make_joint_sweep.py: visit exactly these poses (lerobot deg) instead of variations of plan.json")
     ap.add_argument("--go", action="store_true")
     ap.add_argument("--speed-dps", type=float, default=15.0)
-    ap.add_argument("--hold", action="store_true", help="keep torque on at the end (the start pose is a held home pose that drops when limp)")
     a = ap.parse_args()
     sys.path.insert(0, REPO)
     import pinocchio as pin
-    from ik.openarm_right_ik import arm_ik_class
-    ik = arm_ik_class()(URDF)  # GRASP_ARM=right: the right arm (2026-11-21)
-    lo, hi = np.degrees(ik.lo) + 3, np.degrees(ik.hi) - 3
+    from ik.openarm_left_ik import OpenArmLeftIK
+    ik = OpenArmLeftIK(URDF)
     poses = []
     anchors = []
     if a.poses:  # explicit list (kinematic-calibration sweep); still floor-checked below
         for q in json.load(open(a.poses))["poses"]:
-            q = np.clip(np.array(q, float), lo, hi)
+            q = np.clip(np.array(q, float), LO, HI)
             M = ik.fk(np.deg2rad(q)); tcp = M.translation + M.rotation @ [0, 0, 0.2145]
             if tcp[2] >= FLOOR_Z + 0.06 and M.translation[2] >= FLOOR_Z + 0.10:
                 poses.append(q)
@@ -58,7 +56,7 @@ def main() -> int:
         anchors = [p["q_pre_deg"], p["q_lift_deg"]]
     for an in anchors:
         for v in VAR:
-            q = np.clip(np.array(an) + v, lo, hi)
+            q = np.clip(np.array(an) + v, LO, HI)
             M = ik.fk(np.deg2rad(q)); tcp = M.translation + M.rotation @ [0, 0, 0.2145]
             if tcp[2] >= FLOOR_Z + 0.06 and M.translation[2] >= FLOOR_Z + 0.10:
                 poses.append(q)
@@ -72,21 +70,16 @@ def main() -> int:
     import pyrealsense2 as rs
     from lerobot.robots.openarm_follower import OpenArmFollower, OpenArmFollowerConfig
     from lerobot.motors.damiao.damiao_alignment import soft_move_to_position
-    from lerobot.motors.damiao.openarm_gravity import OpenArmGravityModel
-    ARM = os.environ.get("GRASP_ARM", "left")
-    grav = OpenArmGravityModel(URDF, ARM, 1.0).torque
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-    from grasp.soft_release import release_and_disconnect  # 2026-11-22 Sota: 力を抜くときはゆっくり（ダンプのように）
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))  # grasp/gravity.py を読む
+    from grasp.gravity import gravity_torque_fn
+    grav = gravity_torque_fn("left")  # 手と爪の質量入り（2026-11-23）
     out = os.path.expanduser(f"~/grasp_runs/handeye_near_{time.strftime('%Y%m%d_%H%M%S')}"); os.makedirs(out, exist_ok=True)
     pipe = rs.pipeline(); rc = rs.config(); rc.enable_device(os.environ.get("GRASP_CHEST_SERIAL", "344422070898"))
     rc.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30); rc.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
     prof = pipe.start(rc); scale = prof.get_device().first_depth_sensor().get_depth_scale()
     align = rs.align(rs.stream.color); spatial, holes = rs.spatial_filter(), rs.hole_filling_filter(1)
-    robot = OpenArmFollower(OpenArmFollowerConfig(port=os.environ.get("GRASP_CAN_PORT", "can_fol_r" if ARM == "right" else "can_fol_l"), side=ARM,
-                                                  id=os.environ.get("GRASP_ROBOT_ID", f"follower_{ARM}"), align_on_connect=False, cameras={},
-                                                  disable_torque_on_disconnect=not a.hold))
-    from grasp.held_connect import connect_holding  # 11/22: robot.connect() turned torque off -> the held arm fell onto the cart
-    connect_holding(robot, grav)
+    robot = OpenArmFollower(OpenArmFollowerConfig(port=os.environ.get("GRASP_CAN_PORT", "can_fol_l"), side="left", id=os.environ.get("GRASP_ROBOT_ID", "follower_left"), align_on_connect=False, cameras={}))
+    robot.connect()
     o = robot.get_observation(); start = np.array([o[f"{j}.pos"] for j in J])
     M = ik.fk(np.deg2rad(start))
     qu, ok, _, _ = ik.solve(pin.SE3(M.rotation, M.translation + np.array([0, 0, 0.08])), np.deg2rad(start), position_only=False)
@@ -124,12 +117,8 @@ def main() -> int:
         try:
             go(up, 12); go(start, 12)
         finally:
-            release_and_disconnect(robot, grav); pipe.stop()
-            print(f"[near] back at start, torque {'ON (held)' if a.hold else 'off'}. {len(qs)} samples -> {out}", flush=True)
-            import subprocess  # 2026-11-23: every run's samples go to S3 too (grasp/tools/s3_sync.sh, background)
-            subprocess.Popen(["bash", os.path.join(os.path.dirname(os.path.abspath(__file__)), "s3_sync.sh"), out],
-                             stdout=open(os.path.expanduser("~/grasp_runs/s3_sync.out"), "a"), stderr=subprocess.STDOUT,
-                             start_new_session=True)
+            robot.disconnect(); pipe.stop()
+            print(f"[near] back at start, torque off. {len(qs)} samples -> {out}", flush=True)
     return 0
 
 

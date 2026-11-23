@@ -7,6 +7,10 @@ Left = color + the cut-out object (red) + ROI box (light blue); right = depth.
     PYTHONPATH=. ~/work/GraspGenX/.venv/bin/python grasp/tools/thor_snap.py
     # ROI (image rows and distance) can be narrowed:
     ... thor_snap.py --rows 120:350 --zmin 0.40 --zmax 0.75
+    # 拾う物を名前で選ぶ（grasp/config/objects/<名前>.json・2026-11-22）:
+    ... thor_snap.py --target wood        # alframe（アルミのバー）も。--list-targets で一覧
+    # YOLOE-26 + SigLIP2（本 repo で追加）: 孤立度・ロボットからの距離・積みの高さの規則で対象を決め、その 1 つだけ材質を見る
+    ... thor_snap.py --yoloe
 
 The arm does not move (it only uses the camera). Can't run while record / stream_chest holds the camera.
 """
@@ -23,19 +27,28 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from grasp import remote  # noqa: E402
 from grasp.capture import depth_to_points  # noqa: E402
-from grasp.segment import SegParams, segment_largest_object  # noqa: E402
+from grasp import objects  # noqa: E402
+from grasp.segment import SegParams, segment_clusters  # noqa: E402
 
 THOR = remote.HOST  # 既定は東京の Thor。腕とカメラがこの PC にあるなら GRASP_ROBOT_HOST=local（grasp/remote.py）
 
 
-def self_segments(q_deg):
-    """左腕の関節 3〜7・指先の中心・爪の先を結ぶ線分（腕の付け根の座標）。--self-q で腕の点を消すのに使う。"""
+def self_segments(q_deg, side="left"):
+    """その腕の関節 3〜7・指先の中心・爪の先を結ぶ線分（腕の付け根の座標）。--self-q・--self-q-right で腕の点を消すのに使う。"""
     from grasp import plan as P  # pinocchio・爪の寸法（GRASP_GRIPPER_JSON）を使う
-    from ik.openarm_left_ik import OpenArmLeftIK
-    ik = OpenArmLeftIK()
+    from ik.openarm_left_ik import OpenArmIK
+    ik = OpenArmIK(side=side)
     pts = P.arm_points(ik, np.deg2rad(q_deg))  # 関節 3〜7・その間の中点・指先の中心・爪の先
     chain = [pts[0], pts[1], pts[2], pts[3], pts[4], pts[-2], pts[-1]]
-    return list(zip(chain[:-1], chain[1:]))
+    segs = list(zip(chain[:-1], chain[1:]))
+    # 左右の爪の板（全開の位置・閉じる向き ±45 mm）も線にする（2026-11-23: 腕の線から 3 cm だけ消すと、開いた外側の爪が残り、
+    # 画面の外から来るケーブルとつながって拾う物に選ばれた）。爪の座標の原点は手首の先の面、+Z が近づく向き、+X が閉じる向き
+    import pinocchio as pin
+    Tg = P.t_l7_g(side)
+    MG = ik.data.oMi[ik.model.getJointId(f"openarm_{side}_joint7")].act(pin.SE3(Tg[:3, :3], Tg[:3, 3]))
+    for sx in (-1.0, 1.0):
+        segs.append((MG.act(np.array([sx * 0.045, 0.0, 0.0])), MG.act(np.array([sx * 0.045, 0.0, P.CFG["flange_to_tip_m"]]))))
+    return segs
 RUNS = os.path.join(os.path.dirname(__file__), "..", "runs")
 
 
@@ -54,7 +67,7 @@ def perceive_target(a, img, depth, K, tbc, d):
     try:
         sock.send(msgpack.packb({"bgr": img}, default=mn.encode, use_bin_type=True))
         rep = msgpack.unpackb(sock.recv(), object_hook=mn.decode, raw=False)
-        if a.target == "wood" and "error" not in rep:
+        if a.perceive_target == "wood" and "error" not in rep:
             # 2026-11-21: clear a rigid neighbour first. The aluminium answer above marks the bars (kept as rigid
             # obstacles); a second request finds the wood block, which becomes the target.
             bars = rep["cands"]
@@ -182,6 +195,97 @@ def perceive_target(a, img, depth, K, tbc, d):
                                     f" (others: {[f[4] for f in found[1:]]})")
 
 
+def pick_target(a, img, depth, K, tbc, d):
+    """Generalized heap sorter (2026-11-23): YOLOE-26 prompt-free gives every object's mask in one shot (no text
+    prompts to tune, unlike --perceive's Grounding DINO), and each is back-projected to 3D the same way --perceive
+    does it: real depth where there is enough of it, floor-plane + assumed height where the top is shiny/missing.
+    Rule (pure geometry, no material involved): an object isolated from the rest of the heap beats picking off the
+    top of the heap; among isolated candidates the one nearest the robot (base-frame origin) goes first; among
+    non-isolated ones, whichever sits highest above the floor goes first (same "clear ones, then highest" idea as
+    --perceive, just not hardcoded to bar shapes). Material plays no part in picking the target.
+    Material (grasp.classification.classify_material, SigLIP zero-shot) is found only AFTER the target is decided --
+    the winner of the geometric ranking is classified once, to label it for whichever bin it gets routed to; SigLIP
+    never sees, and never influences the choice of, any other candidate."""
+    import glob
+    import cv2
+    from grasp.segment import segment_object_frames
+    from grasp.classification import classify_material
+    from grasp.plan import floor_plane_base
+
+    if not os.path.exists(tbc):
+        raise RuntimeError("no hand-eye (T_base_cam) to place the floor / rank by distance to the robot")
+    T = np.array(json.load(open(tbc))["T_base_cam"])
+    nb, db = floor_plane_base(d, T)
+    n = T[:3, :3].T @ nb; dd = float(db + nb @ T[:3, 3])  # camera frame: height = n·p + dd
+
+    r = segment_object_frames(d)[0]
+    if r.masks is None or len(r.masks.data) == 0:
+        raise RuntimeError("YOLOE found no objects in this frame")
+    masks = r.masks.data.cpu().numpy() > 0.5
+    confs = r.boxes.conf.cpu().numpy() if r.boxes is not None else np.ones(len(masks))
+
+    v, u = np.mgrid[0:depth.shape[0], 0:depth.shape[1]]
+    P_all = np.stack([(u - K[0, 2]) * depth / K[0, 0], (v - K[1, 2]) * depth / K[1, 1], depth], -1)
+
+    cands = []
+    for i, m in enumerate(masks):
+        if m.shape != depth.shape:
+            m = cv2.resize(m.astype(np.uint8), (depth.shape[1], depth.shape[0]), interpolation=cv2.INTER_NEAREST).astype(bool)
+        m = cv2.erode(m.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+        if m.sum() < 60:
+            continue
+        z = depth[m]; uu, vv = u[m], v[m]
+        P = P_all[m]
+        h = P @ n + dd
+        ok = (z > 0) & (h > 0.005) & (h < a.hmax)
+        if ok.sum() >= max(60, 0.25 * m.sum()):
+            pts, src = P[ok], "depth"
+        else:  # shiny/no-depth top: rays through the mask pixels onto the floor plane raised by the assumed height
+            ray = np.stack([(uu - K[0, 2]) / K[0, 0], (vv - K[1, 2]) / K[1, 1], np.ones(len(uu))], 1)
+            t = (a.obj_height - dd) / (ray @ n)
+            pts = ray * t[:, None]; pts, src = pts[t > 0], "plane+height"
+        if len(pts) < 40:
+            continue
+        pb = pts @ T[:3, :3].T + T[:3, 3]
+        centroid = pb[:, :2].mean(0)
+        cands.append({"mask": m, "pts": pts, "pb": pb, "src": src,
+                     "top": float(np.percentile(pts @ n + dd, 90)),
+                     "centroid": centroid, "radius": float(np.percentile(np.linalg.norm(pb[:, :2] - centroid, axis=1), 90)),
+                     "material": None, "mat_conf": None, "det_conf": float(confs[i])})
+    if not cands:
+        raise RuntimeError("no candidates survived depth/height filtering")
+
+    for c in cands:
+        gaps = [np.linalg.norm(c["centroid"] - o["centroid"]) - c["radius"] - o["radius"] for o in cands if o is not c]
+        c["isolation_gap"] = min(gaps) if gaps else float("inf")
+        c["isolated"] = c["isolation_gap"] > a.isolation_gap
+        c["dist_robot"] = float(np.linalg.norm(c["centroid"]))
+    # isolated-from-the-heap beats the heap; among isolated ones, nearest the robot first; otherwise highest first
+    cands.sort(key=lambda c: (not c["isolated"], c["dist_robot"] if c["isolated"] else -c["top"]))
+    best = cands[0]  # target is decided by geometry alone -- material has no vote
+
+    # NOW classify, once, only the winner -- the losers' material is never needed, so it's never computed
+    ys, xs = np.where(best["mask"])
+    best["material"], best["mat_conf"] = classify_material(img[ys.min():ys.max() + 1, xs.min():xs.max() + 1])
+    best["mat_conf"] = float(best["mat_conf"])
+
+    cv2.imwrite(os.path.join(d, "mask.png"), (best["mask"].astype(np.uint8) * 255))
+    summary = [{k: v for k, v in c.items() if k not in ("mask", "pts", "pb")} for c in cands]
+    json.dump({"cands": summary, "chosen": {k: v for k, v in best.items() if k not in ("mask", "pts", "pb")}},
+              open(os.path.join(d, "pick.json"), "w"), indent=1)
+    for f in glob.glob(os.path.join(d, "object_alt_*.npy")):
+        os.remove(f)
+    for i, c in enumerate([c for c in cands if c is not best][:4]):
+        np.save(os.path.join(d, f"object_alt_{i}.npy"), c["pts"].astype(np.float32))
+
+    ext = best["pts"].max(0) - best["pts"].min(0)
+    return best["pts"].astype(np.float32), (
+        f"{best['material']} ({best['mat_conf']:.2f}) {'isolated' if best['isolated'] else 'heap'} "
+        f"{len(best['pts'])} pts [{best['src']}] size {ext[0]*100:.0f}x{ext[1]*100:.0f}x{ext[2]*100:.0f} cm "
+        f"top {best['top']*100:.1f} cm dist_robot {best['dist_robot']*100:.0f} cm "
+        f"(of {len(cands)} candidates, {sum(c['isolated'] for c in cands)} isolated)")
+
+
 def main(argv=None) -> int:
     import cv2
 
@@ -201,18 +305,40 @@ def main(argv=None) -> int:
     ap.add_argument("--fast", action="store_true", help="short capture (8 warm-up + 4 temporal frames) for back-to-back trials")
     ap.add_argument("--exclude-bright", action="store_true", help="ignore bright unsaturated pixels (aluminium) -> target the wood block next to it")
     ap.add_argument("--exclude-wood", action="store_true", help="ignore wood-coloured pixels (pick the aluminium bar even when a wood block touches it)")
+    ap.add_argument("--self-q", default=None, help="今の左腕の関節角（lerobot の度・7 つ）。腕のまわりの点を切り出しの前に消す（腕が写るとき）")
+    ap.add_argument("--self-r", type=float, default=0.06, help="--self-q で消す、腕の線からの距離 [m]")
+    ap.add_argument("--self-q-right", default=None,
+                    help="右腕の関節角（lerobot の度）。右腕のまわりの点も消す（2026-11-23: --target any で休みの右手を拾わない）")
+    ap.add_argument("--self-drop", type=float, default=0.0,
+                    help=">0 なら、点の半分より多くが腕の線からこの距離 [m] 以内のかたまりを候補から外す（消し残した爪のかけら・"
+                         "--self-r を小さくして腕のすぐ横の物を削らないとき）")
+    ap.add_argument("--target", default=None,
+                    help="拾う物の名前（grasp/config/objects/<名前>.json）。色と大きさが合うかたまりを選び、無ければ object.npy を作らない。"
+                         "無指定なら今までどおりいちばん大きいかたまり")
+    ap.add_argument("--no-separate", action="store_true", help="--target の separate_from（相手の色の画素を消す）を使わない")
+    ap.add_argument("--list-targets", action="store_true", help="登録してある物の名前を出して終わる")
     ap.add_argument("--perceive", default=None, help="host:port of grasp/tools/perceive_server.py: pick the aluminium frame from the "
                     "pile by Grounding DINO + SAM 2 + shape (2026-11-21) instead of the largest cluster")
     ap.add_argument("--alu-thr", type=float, default=0.55, help="minimum aluminium score for --perceive")
     ap.add_argument("--gap-half", type=float, default=0.065, help="--perceive: half the jaw opening across the bar [m]; rigid things closer than this crowd the bar")
     ap.add_argument("--crowd-max", type=float, default=0.10, help="--perceive: bars whose jaw corridor is more than this share filled (1 cm cells) go after the clear ones")
-    ap.add_argument("--target", choices=["alu", "wood"], default="alu", help="--perceive: what to pick. wood = the wood block "
-                    "next to the bars (clear a rigid neighbour first); the bars stay rigid obstacles")
+    ap.add_argument("--perceive-target", dest="perceive_target", choices=["alu", "wood"], default="alu",
+                    help="--perceive: what to pick. wood = the wood block next to the bars (clear a rigid neighbour first); "
+                         "the bars stay rigid obstacles. (Renamed from the old --target, which --target now means for grasp/objects.py)")
     ap.add_argument("--skip-crowded", action="store_true", help="--perceive: fail (no target) when every bar is crowded, instead of trying the least bad")
     ap.add_argument("--alu-height", type=float, default=0.03, help="assumed bar height [m] when its depth is missing (shiny top)")
-    ap.add_argument("--self-q", default=None, help="今の左腕の関節角（lerobot の度・7 つ）。腕のまわりの点を切り出しの前に消す（腕が写るとき）")
-    ap.add_argument("--self-r", type=float, default=0.06, help="--self-q で消す、腕の線からの距離 [m]")
+    ap.add_argument("--yoloe", action="store_true", help="pick the target with YOLOE-26, ranked by the isolated-from-heap / "
+                    "nearest-robot / highest-in-heap rule (material plays no part in picking), instead of --perceive's "
+                    "Grounding DINO aluminium-only pipeline; the winner is then labelled by material "
+                    "(grasp/classification.py, SigLIP) for routing to a bin")
+    ap.add_argument("--isolation-gap", type=float, default=0.03, help="--yoloe: min gap [m] to the nearest other candidate's "
+                    "footprint to count as isolated from the heap")
+    ap.add_argument("--obj-height", type=float, default=0.02, help="--yoloe: assumed object height [m] when its depth is missing")
     a = ap.parse_args(argv)
+    if a.list_targets:
+        print("\n".join(objects.names()))
+        return 0
+    spec = objects.load(a.target) if a.target else None  # 撮る前に名前を確かめる
 
     os.makedirs(RUNS, exist_ok=True)
     if a.cap:
@@ -230,9 +356,15 @@ def main(argv=None) -> int:
     depth = np.load(os.path.join(d, "depth.npy"))
     K = np.array(json.load(open(os.path.join(d, "intrinsics.json")))["K"])
     img = cv2.imread(os.path.join(d, "color.png"))
+    img_raw = img.copy()  # 色で見分けるのは描き込む前の画像
 
+    for stale in ("object.npy", "target.json"):  # --cap で撮り直さずに切り直すとき、前の結果を残さない
+        if os.path.exists(os.path.join(d, stale)):
+            os.remove(os.path.join(d, stale))
     v0, v1 = map(int, a.rows.split(":")); u0, u1 = map(int, a.cols.split(":"))
     dm = np.zeros_like(depth); dm[v0:v1, u0:u1] = depth[v0:v1, u0:u1]
+    if spec is not None and not a.no_separate and spec["separate_from"]:  # 触れている相手（例: 木片の隣のアルミ）と分ける
+        dm[objects.separate_mask(img, spec)] = 0
     if a.exclude_wood:  # drop wood-coloured pixels (brown hue, saturated) so a touching wood block doesn't merge with the target
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         wood = ((hsv[..., 0] >= 8) & (hsv[..., 0] <= 35) & (hsv[..., 1] >= 30)).astype(np.uint8)
@@ -248,13 +380,18 @@ def main(argv=None) -> int:
     tbc = os.environ.get("GRASP_T_BASE_CAM", os.path.join(os.path.dirname(__file__), "..", "config", "T_base_cam.json"))
     if os.environ.get("GRASP_SITE") and "GRASP_T_BASE_CAM" not in os.environ:  # 東京のハンドアイで腕の届く範囲を切らない
         tbc = ""
-    if a.self_q and os.path.exists(tbc):
+    segs = []
+    if (a.self_q or a.self_q_right) and os.path.exists(tbc):
+        for qs, sd in ((a.self_q, "left"), (a.self_q_right, "right")):
+            if qs:
+                segs += self_segments([float(v) for v in qs.split(",")], side=sd)
+    if segs:
         # ロボット自身の左腕を消す（2026-11-21 北九州）: 机に寝かせた休みの姿勢では左手がカメラに写り、近くに置いた物と
         # ひとかたまりで切り出された。今の関節角から腕の線（関節 3〜7・指先・爪の先）を出し、そこから --self-r 以内の点を消す
         T = np.array(json.load(open(tbc))["T_base_cam"])
         pb = pts @ T[:3, :3].T + T[:3, 3]
         keep = np.ones(len(pts), bool)
-        for p0, p1 in self_segments([float(v) for v in a.self_q.split(",")]):
+        for p0, p1 in segs:
             seg = p1 - p0; t = np.clip(((pb - p0) @ seg) / max(seg @ seg, 1e-9), 0, 1)
             keep &= np.linalg.norm(pb - (p0 + t[:, None] * seg), axis=1) > a.self_r
         print(f"[snap] self-filter: removed {int((~keep).sum())} points of the robot's own arm", flush=True)
@@ -266,7 +403,19 @@ def main(argv=None) -> int:
         inb = (pb[:, 0] > x0) & (pb[:, 0] < x1) & (pb[:, 1] > y0) & (pb[:, 1] < y1)
         pts = pts[inb | floor_like]
     msg = ""
-    if a.perceive:
+    if a.yoloe:
+        try:
+            obj, msg = pick_target(a, img, depth, K, tbc, d)
+            np.save(os.path.join(d, "object.npy"), obj)
+            uv = obj @ K.T; uv = (uv[:, :2] / uv[:, 2:]).astype(int)
+            for u, v in uv[:: max(1, len(uv) // 1500)]:
+                if 0 <= u < img.shape[1] and 0 <= v < img.shape[0]:
+                    cv2.circle(img, (u, v), 1, (0, 0, 255), -1)
+        except RuntimeError as e:
+            msg = f"pick failed: {e}"
+            if os.path.exists(os.path.join(d, "object.npy")):
+                os.remove(os.path.join(d, "object.npy"))
+    elif a.perceive:
         try:
             obj, msg = perceive_target(a, img, depth, K, tbc, d)
             np.save(os.path.join(d, "object.npy"), obj)
@@ -280,13 +429,45 @@ def main(argv=None) -> int:
                 os.remove(os.path.join(d, "object.npy"))
     else:
       try:
-        obj, dbg = segment_largest_object(pts, SegParams(zmax=a.zmax, above_plane_max=a.hmax), return_debug=True)
+        clusters, dbg = segment_clusters(pts, SegParams(zmax=a.zmax, above_plane_max=a.hmax))
+        if segs and a.self_drop > 0:  # 消し残した腕（爪のかけら）のかたまりを外す
+            T = np.array(json.load(open(tbc))["T_base_cam"])
+
+            def near_arm(c):
+                cb = c @ T[:3, :3].T + T[:3, 3]
+                dmin = np.full(len(cb), np.inf)
+                for p0, p1 in segs:
+                    sg = p1 - p0; t = np.clip(((cb - p0) @ sg) / max(sg @ sg, 1e-9), 0, 1)
+                    dmin = np.minimum(dmin, np.linalg.norm(cb - (p0 + t[:, None] * sg), axis=1))
+                return float(np.mean(dmin <= a.self_drop))
+            fr = [near_arm(c) for c in clusters]
+            dropped = [i for i, f in enumerate(fr) if f > 0.5]
+            if dropped:
+                print(f"[snap] self-filter: 腕のかけらとして外したかたまり {len(dropped)} 個", flush=True)
+            clusters = [c for c, f in zip(clusters, fr) if f <= 0.5]
+            if not clusters:
+                raise RuntimeError("腕のかけらのほかに物が無い")
+        best = 0
+        if spec is not None:
+            for c in clusters:  # 選ばなかったかたまりは黄色（どれと見分けたかを図で見る）
+                uv = c @ K.T; uv = (uv[:, :2] / uv[:, 2:]).astype(int)
+                for u, v in uv:
+                    if 0 <= u < img.shape[1] and 0 <= v < img.shape[0]:
+                        cv2.circle(img, (u, v), 1, (0, 220, 255), -1)
+            best, table = objects.pick(clusters, K, img_raw, spec, plane=dbg.get("plane"))
+            with open(os.path.join(d, "target.json"), "w") as f:  # どのかたまりを何で選んだか・外したかの記録
+                json.dump({"target": spec["name"], "picked": best, "clusters": table,
+                           "separate_from": [] if a.no_separate else spec["separate_from"]}, f, indent=2)
+            if best is None:
+                raise RuntimeError(objects.not_found(spec, table))
+        obj = clusters[best]
         uv = obj @ K.T; uv = (uv[:, :2] / uv[:, 2:]).astype(int)
         for u, v in uv:
             if 0 <= u < img.shape[1] and 0 <= v < img.shape[0]:
                 cv2.circle(img, (u, v), 1, (0, 0, 255), -1)
         ext = obj.max(0) - obj.min(0)
-        msg = f"object {len(obj)} pts  size {ext[0]*100:.0f}x{ext[1]*100:.0f}x{ext[2]*100:.0f} cm  dist {obj[:, 2].mean():.2f} m"
+        msg = (f"{spec['name']} " if spec else "") + \
+              f"object {len(obj)} pts  size {ext[0]*100:.0f}x{ext[1]*100:.0f}x{ext[2]*100:.0f} cm  dist {obj[:, 2].mean():.2f} m"
         np.save(os.path.join(d, "object.npy"), obj)
       except RuntimeError as e:
         msg = f"segment failed: {e}"

@@ -123,6 +123,33 @@ set -a; source grasp/config/sites/kitakyushu-collect.env; set +a
 - 腕のモデルを作り直す: `python3 grasp/curobo/make_urdf.py` の後に、`grasp/curobo/` で `~/work/curobo/.venv/bin/python -m curobo.examples.getting_started.build_robot_model --urdf $PWD/openarm_left_umi.urdf --asset-path $PWD --tool-frames openarm_left_link7 --output $PWD/openarm_left_umi.yml --seed 0`
 - 手の本体（モーターの箱）は `make_urdf.py` の `GRIPPER_BODY_*`（実物と合うと 2026-11-21 に確かめた）
 
+## 右腕を足す・両腕で計算して良い方で掴む（2026-11-22・作業者: Munenori）
+
+右リーダーに左と同じグリッパー（so101 のフィンレイ指）を鏡写しに付け、1 つの物に対して左右の計画を同時に計算し、良い方の腕で掴む（2 本が同時に動くことはない）。
+
+- 計画: `plan.py --arm both`（`left`・`right` も可。既定は `GRASP_ARM` か `left`）。左右を別のプロセスで同時に計算し、GraspGenX の点数の高い方の腕を選ぶ。点数の差が `--arm-tie`（0.05）以内なら、今の姿勢から pregrasp までの関節の動きが小さい方を選ぶ。`plan.json` に `"arm"` を書き、腕ごとの結果は `plan_left.json`・`plan_right.json` にも残す。左だけのときより約 0.5 秒長い。ENPIRE からは `--plan-args "... --arm both"` で渡す
+- 実行: `run_grasp.py` は `plan.json` の腕を動かす。右の値（`GRASP_CAN_PORT_RIGHT`・`GRASP_ROBOT_ID_RIGHT`・`GRASP_GRIPPER_OPEN_RIGHT`・`GRASP_GRIPPER_CLOSE_RIGHT`）が置き場の env に無いと、`--go` は腕につなぐ前に止まる。左の値に落とさない（`grasp/arm.py`）。右で `--home` を使うときは `--home-right` か `GRASP_HOME_RIGHT` が要る
+- 当たり判定: 右は 2 つ目のサーバー `server.py --arm right`（port 5559・`GRASP_CUROBO_RIGHT`）。左の cuRobo のモデル（`openarm_left_umi.yml` の球）を鏡に写して使うので、球を当てはめ直せば右にも効く。URDF の右腕の各 link の形は左の鏡写しではない（同じ部品を右の枠に置いた物・手首で最大 58 mm 違う）ので、球は link ごとに右の座標へ置き直す（`grasp/curobo/model.py` の `right_local_center`）。グリッパーは鏡写しのまま
+- 左右の対応: `q_右 = [-1,-1,-1,+1,-1,-1,-1] * q_左` で、link の枠と指先が鏡写しになる（link4 だけ肘の軸に沿って 63 mm ずれる）。`tests/test_arm.py` が URDF で確かめる
+- 撮影時の腕の点を消すのに、右は `GRASP_REST_RIGHT` を使う。無いと右腕自身が障害物に見えて、右の計画と移動が止まる（当たらない側に倒れる）
+- **まだ実機で確かめていない**。右腕を付けたら、`grasp/config/sites/kitakyushu-collect.env` の右腕の節にある 1〜6 を確かめてから、`#` の付いた行を外す
+
+```bash
+~/work/curobo/.venv/bin/python grasp/curobo/server.py               # 左（5558）
+~/work/curobo/.venv/bin/python grasp/curobo/server.py --arm right   # 右（5559）
+PYTHONPATH=.:~/work/GraspGenX ~/work/GraspGenX/.venv/bin/python grasp/plan.py <cap> --q "$GRASP_REST" --arm both ...
+```
+
+## 拾う物を名前で選ぶ（2026-11-22・作業者: Munenori）
+
+何も付けないと、机の上で**いちばん大きいかたまり**を拾う。北九州の記録では、そのやり方だと奥の段ボールを拾っていた（`--zmin 0.20 --band none` のとき）。`--target <名前>` を付けると、登録した物の色と大きさが合うかたまりだけを選ぶ。
+
+- 登録は `grasp/config/objects/<名前>.json`: 色（HSV）・色が合う点の割合の下限・外形の範囲・一緒に置いたときに消す相手（`separate_from`）。今あるのは `wood`（木片）と `alframe`（アルミのバー・北九州の実物ではまだ確かめていない）。一覧は `thor_snap.py --list-targets` で見る
+- 合うかたまりが無ければ `object.npy` を作らず止まる。いちばん大きいかたまりには戻らない。どのかたまりを何で外したかは、撮った記録の `target.json` に残る。図（`overlay.jpg`）では、選んだかたまりが赤、外したかたまりが黄色になる
+- 流れの中で使うときは `live.py prepare --snap-args "--hmax 0.10 --target wood"`。`plan.json` に `target` が入り、手首カメラの位置合わせ（`run_grasp_servo.py`）にも同じ見分け方が渡る。オフラインの ENPIRE ループでは params の `"target": "wood"` を使う
+- 新しい物を足すときは json を 1 つ足し、`PYTHONPATH=. ~/work/GraspGenX/.venv/bin/python -m unittest discover -s tests -q` を通す
+- `--yoloe`（本 repo で追加）は別の選び方: YOLOE-26 のマスク + 孤立度・ロボットからの距離・積みの高さの規則で対象を決め、SigLIP2（`grasp/classification.py`）はその対象 1 つだけを後から材質で分ける。`--target` の色・大きさ指定より、見たことの無い物や材質の見分けが要るときに向く
+
 ## 回し方（腕が動くのは execute と batch だけ）
 
 ```bash

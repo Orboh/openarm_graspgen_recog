@@ -27,7 +27,6 @@ import io
 import json
 import os
 import subprocess
-import time
 import sys
 
 import numpy as np
@@ -128,9 +127,8 @@ def cmd_new_iter(a):
     best = loop.best_record(src, T_BC_PATH)
     meta = {"iter": it, "hypothesis": a.hypothesis, "source": src, "parent": best and best["iter"],
             "params": {**policy.load(None), "planner": "grasp/plan.py", "executor": a.executor, "home": a.home,
-                       "exec_args": a.exec_args, "auto_place": a.auto_place, "drop": a.drop,
-                       "plan_args": a.plan_args, "decide": bool(getattr(a, "decide", False)),
-                       "other_args": getattr(a, "other_args", "")},
+                       "exec_args": a.exec_args, "auto_place": a.auto_place,
+                       "plan_args": a.plan_args},
             "t_base_cam": T_BC_PATH, "verifier_version": contract.VERIFIER_VERSION,
             "gate": contract.SUCCESS_GATE, "budget": a.budget, "started": loop.now(), "status": "running"}
     loop.wjson(os.path.join(d, "iteration.json"), meta)
@@ -178,23 +176,7 @@ def cmd_prepare(a):
     else:
         obs["seg_error"] = line[-1].split(" | ", 1)[-1]
     plan_ok = False
-    if meta["params"].get("decide"):
-        # 2026-11-21: decide what to take first (all objects + image-language model + planner check), grasp/tools/decide.py
-        for f in ("object.npy", "plan.json"):
-            if os.path.exists(os.path.join(cap_dir, f)):
-                os.remove(os.path.join(cap_dir, f))
-        drc, dout = _inproc("grasp.tools.decide", [cap_dir, f"--q={q}", "--plan-args=" + meta["params"]["plan_args"],
-                                                  *(["--other-args=" + meta["params"]["other_args"]] if meta["params"].get("other_args") else [])])
-        info["plan_log"] = "\n".join(l for l in dout.splitlines() if "INFO" not in l and "warn" not in l.lower())[-2500:]
-        dj = os.path.join(cap_dir, "decision.json")
-        if os.path.exists(dj):
-            dec = json.load(open(dj))
-            info["decision"] = {k2: dec.get(k2) for k2 in ("say", "confident", "why_low", "chosen", "seconds")}
-        plan_ok = drc == 0 and os.path.exists(os.path.join(cap_dir, "plan.json"))
-        obs["obj"] = np.load(os.path.join(cap_dir, "object.npy")) if plan_ok else None
-        if not plan_ok:
-            obs["seg_error"] = (info.get("decision") or {}).get("say") or "decide: nothing to take"
-    elif obs["obj"] is not None:
+    if obs["obj"] is not None:
         if os.path.exists(os.path.join(cap_dir, "plan.json")):
             os.remove(os.path.join(cap_dir, "plan.json"))
         prc, pout = _inproc("grasp.plan", [cap_dir, f"--q={q}", "--reinfer", *meta["params"]["plan_args"].split()])
@@ -210,26 +192,24 @@ def cmd_prepare(a):
         plan["block_extent_Xg_m"] = float(np.ptp(ob @ Tgb[:3, 0]))
         plan["exclude_wood"] = "--exclude-wood" in a.snap_args
         plan["exclude_bright"] = "--exclude-bright" in a.snap_args
+        tgt_path = os.path.join(cap_dir, "target.json")
+        if os.path.exists(tgt_path):  # thor_snap --target（2026-11-22）: 拾う物の名前を残し、手首カメラの位置合わせにも同じ見分け方を渡す
+            tgt = json.load(open(tgt_path))
+            plan["target"] = tgt["target"]
+            # run_grasp_servo.py の旗の意味: exclude_wood = 対象はアルミ（色で測る）、exclude_bright = 対象は木片（アルミの隣）
+            plan["exclude_wood"] |= "wood" in tgt["separate_from"]
+            plan["exclude_bright"] |= "alframe" in tgt["separate_from"]
         if a.place_offset:
             plan["place_offset_m"] = [float(v) for v in a.place_offset.split(",")]
         plan["block_height_m"] = float(np.percentile(ob[:, 2], 98) - np.percentile(ob[:, 2], 2))
         json.dump(plan, open(os.path.join(cap_dir, "plan.json"), "w"), indent=2)
-        if meta["params"].get("drop"):  # throw aside beside the left shoulder after the lift (grasp/tools/plan_drop.py)
-            rc, dout = _inproc("grasp.tools.plan_drop", [cap_dir, "--at", meta["params"]["drop"]])
-            info["drop"] = [l for l in dout.splitlines() if l.startswith("[drop]")][-1:] or [dout[-300:]]
-            drop_fail = rc != 0
-            plan = json.load(open(os.path.join(cap_dir, "plan.json")))
         if meta["params"].get("auto_place"):
             _, ppout = _inproc("grasp.tools.plan_place", [cap_dir, "--seed", str(k)])
             info["place"] = [l for l in ppout.splitlines() if l.startswith("[place]")][-1:] or [ppout[-300:]]
             plan = json.load(open(os.path.join(cap_dir, "plan.json")))
-        # plan.py may have swapped to another aluminium frame (object_alt_* -> object.npy): judge the bar it planned on
-        obs["obj"] = np.load(os.path.join(cap_dir, "object.npy"))
         G_cam = np.linalg.inv(T_bc) @ np.array(plan["T_grasp_base"])
         obs.update(grasp=G_cam, score=plan["score"],
                    ik={"converged": True, "pos_err_m": 0.0, "rot_err_deg": 0.0})
-        if meta["params"].get("drop") and drop_fail:  # no reachable drop pose -> not executable (counts as IK)
-            obs["ik"] = {"converged": False, "pos_err_m": float("nan"), "rot_err_deg": float("nan")}
         info["plan"] = {k2: plan[k2] for k2 in ("rank", "score", "tilt_deg", "tcp_to_object_m", "q_pre_deg",
                                                "q_grasp_deg", "q_lift_deg")}
         # dry check on Thor (FK floor checks of every segment, no motion)
@@ -247,9 +227,7 @@ def cmd_prepare(a):
             if meta["params"].get("home"):
                 largs += ["--home", os.path.join(REPO, meta["params"]["home"])]
             _, dout = _inproc("grasp.run_grasp", largs)
-            ls_ = dout.strip().splitlines()
-            # keep the cuRobo detours too (the panel shows them before GO)
-            dry = "\n".join([l for l in ls_[:-4] if "回り込む" in l or "Stopping" in l] + ls_[-4:])
+            dry = "\n".join(dout.strip().splitlines()[-4:])
         else:
             dry = ssh(f"cd ~/grasp_work && {remote.env_assign()}~/projects/lerobot/.venv/bin/python grasp/{exe} ~/grasp_runs/{cap} "
                       f"--start={q_rest}{homearg} 2>&1 | grep -v Warn | tail -4", timeout=120, check=False)
@@ -285,10 +263,6 @@ def cmd_prepare(a):
     if os.path.exists(os.path.join(cap_dir, "plan.png")):
         import shutil
         shutil.copy(os.path.join(cap_dir, "plan.png"), os.path.join(tdir, "plan.png"))
-    import shutil
-    for f in ["perceive.jpg", "perceive.json", "plan_stats.json", "decision.json", "decision.jpg", "objects.jpg"] + [os.path.basename(x) for x in glob.glob(os.path.join(cap_dir, "plan_funnel_*.jpg")) + glob.glob(os.path.join(cap_dir, "advice_*.jpg"))]:
-        if os.path.exists(os.path.join(cap_dir, f)):  # the panel's step-by-step view (2026-11-21)
-            shutil.copy(os.path.join(cap_dir, f), os.path.join(tdir, f))
     loop.wjson(os.path.join(tdir, "result.json"), res)
     loop.event("trial_prepared", iter=a.iter, trial=k, scene=cap, ready=res["ready_to_execute"], cause=res["cause"])
     print(json.dumps({"trial": os.path.basename(tdir), "ready": res["ready_to_execute"], "cause": res["cause"],
@@ -321,16 +295,10 @@ def cmd_execute(a):
         f"~/grasp_runs/{cap} --go{homearg}{' --wrist-snap' if exe == 'run_grasp.py' else ''} {meta['params'].get('exec_args', '')} 2>&1 | tee ~/grasp_runs/{cap}/run.log; sleep 600'")
     import time
     log = ""
-    t_end = time.time() + 600  # 2026-11-21: a fixed 80 polls (~2.5 min with ssh) cut off the longer drop runs -> "(h) aborted"
-    while time.time() < t_end:
+    for _ in range(80):  # ~4 min max
         time.sleep(0.5)
         log = ssh(f"grep -v -i warn ~/grasp_runs/{cap}/run.log 2>/dev/null || true", check=False)
         if any(s in log for s in ("torque off", "holding (torque on)", "Traceback")):
-            break
-        alive = ssh(f"pgrep -f 'grasp/{exe} .*{cap}' >/dev/null && echo yes || echo no", check=False).strip()
-        if alive == "no" and log:  # the executor exited without its end line (crash / kill): stop waiting
-            time.sleep(1.0)
-            log = ssh(f"grep -v -i warn ~/grasp_runs/{cap}/run.log 2>/dev/null || true", check=False)
             break
     traj = ssh(f"cat ~/grasp_runs/{cap}/traj.csv 2>/dev/null || true", check=False)
     open(os.path.join(tdir, "run.log"), "w").write(log)
@@ -367,39 +335,6 @@ def cmd_execute(a):
                gripper_at_hold=g_hold)
     print(json.dumps({"success": res["success"], "cause": res["cause"], "gripper_at_hold_deg": g_hold,
                       "completed": completed, "log_tail": log.strip().splitlines()[-6:]}, indent=1))
-
-
-def cmd_observe(a):
-    """Record what the operator saw and use it as the lift measurement for an executed trial.
-
-    2026-11-21: live.py measured "lifted" by the gripper angle at the hold (<= -8 deg = something between the jaws).
-    That proxy fails for the bare aluminium bar: with a firm grip the fin-ray jaws close to about -1..-4 deg around the
-    4.6 cm bar, so every lift the operator saw was recorded as a failure. The verifier (contract.py) is unchanged: it
-    still needs lift_m >= LIFT_MIN_M; only the source of lift_m changes (operator: LIFT_M if lifted and held, else 0)."""
-    d = iter_dir(a.iter)
-    tdir = sorted(glob.glob(os.path.join(d, "trials", f"{int(a.trial):02d}_*")))[0]
-    res = json.load(open(os.path.join(tdir, "result.json")))
-    if res.get("stage") != "executed":
-        raise SystemExit(f"[live] trial {a.trial} was not executed")
-    lifted = a.lifted == "yes"
-    if a.completed:  # the run log shows it finished (fixes trials the old 80-poll watcher marked "(h) aborted")
-        res["run_completed"] = True
-    obs = {"obj": np.load(os.path.join(res["info"]["scene_dir"], "object.npy")), "plane": None,
-           "grasp": np.array(res["grasp"]), "score": res["score"],
-           "ik": {"converged": True, "pos_err_m": 0.0, "rot_err_deg": 0.0},
-           "lift_m": LIFT_M if (lifted and res.get("run_completed", True)) else 0.0}
-    new = contract.evaluate(obs)
-    new["predicates"]["top_down"] = res["predicates"]["top_down"]
-    new["predicates"]["lifted"]["note"] = (f"operator: {'lifted' if lifted else 'not lifted'}"
-                                           + (f" ({a.note})" if a.note else "") + f"; gripper at hold {res.get('gripper_at_hold_deg')} deg")
-    app = [k2 for k2 in contract.PREDICATES if new["predicates"][k2]["status"] != "SKIPPED"]
-    new["success"] = all(new["predicates"][k2]["status"] == "PASS" for k2 in app)
-    new["cause"] = "success" if new["success"] else next(contract.CAUSE[k2] for k2 in contract.PREDICATES
-                                                         if new["predicates"][k2]["status"] == "FAIL")
-    res.update(new, lift_source="operator", operator_lifted=lifted, operator_note=a.note)
-    loop.wjson(os.path.join(tdir, "result.json"), res)
-    loop.event("operator_lift", iter=a.iter, trial=a.trial, lifted=lifted, note=a.note, success=res["success"])
-    print(f"[live] {a.iter} trial {a.trial}: operator {'lifted' if lifted else 'not lifted'} -> success={res['success']} ({res['cause']})")
 
 
 def cmd_teach(a):
@@ -461,12 +396,11 @@ def cmd_batch(a):
         ok += int(bool(r.get("success")))
         fails = 0 if r.get("success") else fails + 1
         loop.event("batch_progress", iter=a.iter, done=done, ok=ok, last=r.get("cause"))
-        print(f"[batch] {done}/{a.n}: {'OK' if r.get('success') else 'FAIL'} ({r.get('cause')})  total {ok}/{done}  "
-              f"gripper at hold {r.get('gripper_at_hold_deg')} deg  trial {ready}", flush=True)
+        print(f"[batch] {done}/{a.n}: {'OK' if r.get('success') else 'FAIL'} ({r.get('cause')})  total {ok}/{done}", flush=True)
         if not r.get("run_completed"):
             reason = "execution did not complete"; break
-        if a.max_fails and fails >= a.max_fails:
-            reason = f"{a.max_fails} failed grasps in a row"; break
+        if fails >= 3:
+            reason = "3 failed grasps in a row"; break
     loop.event("batch_end", iter=a.iter, reason=reason, done=done, ok=ok)
     print(f"[batch] end: {reason}; {ok}/{done} lifted", flush=True)
 
@@ -503,122 +437,30 @@ def cmd_close(a):
     print(decision, sr, hist)
 
 
-def cmd_stir(a):
-    """Loosen the pile (grasp/tools/plan_stir.py): capture -> stroke along the seam beside the target bar -> dry run.
-    With --i-have-operator-go it runs on Thor (run_grasp.py --push, closed jaws) and captures the pile again after.
-    Records go to <iter>/stirs/NN_<cap>/ (not a grasp trial: no verifier)."""
-    d = iter_dir(a.iter)
-    meta = json.load(open(os.path.join(d, "iteration.json")))
-    b = busy()
-    if b:
-        raise SystemExit("[live] Thor is busy:\n  " + "\n  ".join(b))
-    import yaml
-    hy = yaml.safe_load(open(os.path.join(REPO, meta["params"]["home"])))
-    q_home = ",".join(f"{float(hy[f'joint_{i}']):.1f}" for i in range(1, 8))
-    sd = os.path.join(d, "stirs"); os.makedirs(sd, exist_ok=True)
-    if a.planned:  # run the stroke the operator approved (planned and dry-run by an earlier `stir` call), unchanged
-        tdir = sorted(glob.glob(os.path.join(sd, f"{int(a.planned):02d}_*")))[0]
-        cap = os.path.basename(tdir).split("_", 1)[1]; cap_dir = os.path.join(REPO, "grasp", "runs", cap); k = int(a.planned)
-        import shutil
-        shutil.copy(os.path.join(tdir, "push.json"), cap_dir)
-        if not a.i_have_operator_go:
-            raise SystemExit("[live] --planned needs --i-have-operator-go")
-        return _stir_exec(a, d, meta, sd, tdir, cap, cap_dir, k)
-    src, out = _inproc("grasp.tools.thor_snap", ["--no-view", "--fast", *a.snap_args.split()])
-    line = [l for l in out.splitlines() if " | " in l]
-    if not line:
-        raise SystemExit(f"[live] thor_snap failed:\n{out[-600:]}")
-    cap = line[-1].split(" | ")[0].strip(); cap_dir = os.path.join(REPO, "grasp", "runs", cap)
-    print("[live] " + line[-1])
-    k = len(glob.glob(os.path.join(sd, "*")))
-    tdir = os.path.join(sd, f"{k:02d}_{cap}"); os.makedirs(tdir)
-    rc, out = _inproc("grasp.tools.plan_stir", [cap_dir, "--q", q_home, *a.stir_args.split()])
-    print(out.strip())
-    open(os.path.join(tdir, "plan_stir.log"), "w").write(out)
-    if rc != 0 or not os.path.exists(os.path.join(cap_dir, "push.json")):
-        loop.event("stir_planned", iter=a.iter, stir=k, scene=cap, ok=False); raise SystemExit("[live] no stir stroke")
-    rc, out = _inproc("grasp.run_grasp", [cap_dir, "--push", "--home", os.path.join(REPO, meta["params"]["home"]), "--hold-home"])
-    open(os.path.join(tdir, "dry_run.log"), "w").write(out)
-    if "DRY RUN" not in out:
-        loop.event("stir_planned", iter=a.iter, stir=k, scene=cap, ok=False); raise SystemExit("[live] dry run failed:\n" + out[-800:])
-    import shutil
-    shutil.copy(os.path.join(cap_dir, "push.json"), tdir); shutil.copy(os.path.join(cap_dir, "color.png"), os.path.join(tdir, "before.png"))
-    loop.event("stir_planned", iter=a.iter, stir=k, scene=cap, ok=True)
-    print(f"[live] stir {k} planned, dry run ok ({tdir})")
-    if not a.i_have_operator_go:
-        return
-    return _stir_exec(a, d, meta, sd, tdir, cap, cap_dir, k)
-
-
-def _stir_exec(a, d, meta, sd, tdir, cap, cap_dir, k):
-    import shutil
-    exe = deploy_executor("grasp/run_grasp.py")
-    remote.put(os.path.join(REPO, meta["params"]["home"]), "grasp_work/grasp/config/")
-    remote.put(os.path.join(cap_dir, "push.json"), f"grasp_runs/{cap}/")
-    homearg = f" --home ~/grasp_work/grasp/config/{os.path.basename(meta['params']['home'])}"
-    ex = meta["params"].get("exec_args", "").replace("--retries", "--_x").split(" --_x")[0]
-    loop.event("stir_execute", iter=a.iter, stir=k, scene=cap)
-    ssh("tmux kill-session -t enpire 2>/dev/null; "
-        f"tmux new -d -s enpire 'cd ~/grasp_work && {remote.env_assign()}~/projects/lerobot/.venv/bin/python -u grasp/{exe} "
-        f"~/grasp_runs/{cap} --go --push{homearg} {ex} 2>&1 | tee ~/grasp_runs/{cap}/run.log; sleep 600'")
-    t_end = time.time() + 400
-    log = ""
-    while time.time() < t_end:
-        time.sleep(3)
-        log = ssh(f"grep -v -i warn ~/grasp_runs/{cap}/run.log 2>/dev/null || true", check=False)
-        if "back at start" in log or "Traceback" in log:
-            break
-    open(os.path.join(tdir, "run.log"), "w").write(log)
-    remote.get(f"grasp_runs/{cap}/traj.csv", tdir, check=False)
-    print("\n".join(l for l in log.splitlines() if "[run]" in l))
-    src, out = _inproc("grasp.tools.thor_snap", ["--no-view", "--fast", *a.snap_args.split()])
-    line = [l for l in out.splitlines() if " | " in l]
-    if line:
-        after = line[-1].split(" | ")[0].strip()
-        shutil.copy(os.path.join(REPO, "grasp", "runs", after, "color.png"), os.path.join(tdir, "after.png"))
-        print("[live] after: " + line[-1])
-    loop.event("stir_done", iter=a.iter, stir=k, scene=cap, completed="back at start" in log)
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("new-iter"); s.add_argument("--hypothesis", required=True)
     s.add_argument("--budget", type=int, default=10); s.add_argument("--plan-args", default="")
     s.add_argument("--executor", default="grasp/run_grasp.py", help="repo-relative executor run on Thor")
-    s.add_argument("--drop", nargs="?", const="0.05,0.45,0.42", default="",
-                   help="after the lift carry the object beside the left shoulder and drop it there (x,y,z jaw-TCP point, base frame)")
     s.add_argument("--auto-place", action="store_true", help="self-reset: after the lift put the object down at a new spot (plan_place.py)")
     s.add_argument("--exec-args", default="", help="extra args for the executor on --go (e.g. speeds)")
     s.add_argument("--home", default="", help="repo-relative start-pose YAML: every trial starts and ends there (plan seeds from it)")
-    s.add_argument("--decide", action="store_true", help="pile: decide what to take first (grasp/tools/decide.py: all objects, "
-                   "image-language model, planner check); --plan-args are for aluminium")
-    s.add_argument("--other-args", default="", help="with --decide: plan.py args for moving a non-aluminium obstacle")
     s = sub.add_parser("prepare"); s.add_argument("--iter", required=True)
     s.add_argument("--place-offset", default="", help="dx,dy [m] base frame: after the lift, put the object down there (clear an obstacle)")
     s.add_argument("--snap-args", default="", help="extra args for thor_snap.py (ROI etc.)")
     s = sub.add_parser("execute"); s.add_argument("--iter", required=True); s.add_argument("--trial", required=True)
     s.add_argument("--i-have-operator-go", action="store_true")
     s = sub.add_parser("close"); s.add_argument("--iter", required=True)
-    s = sub.add_parser("observe"); s.add_argument("--iter", required=True); s.add_argument("--trial", required=True)
-    s.add_argument("--lifted", choices=["yes", "no"], required=True); s.add_argument("--note", default="")
-    s.add_argument("--completed", action="store_true", help="the run log ends with 'torque off'/'holding' (mark run_completed)")
     s = sub.add_parser("teach"); s.add_argument("--cap", required=True); s.add_argument("--note", default="")
     s = sub.add_parser("batch"); s.add_argument("--iter", required=True); s.add_argument("--n", type=int, default=20)
     s.add_argument("--snap-args", default="--hmax 0.10"); s.add_argument("--i-have-operator-go", action="store_true")
-    s.add_argument("--max-fails", type=int, default=3, help="stop after this many verifier failures in a row; 0 = never "
-                   "(2026-11-21: the gripper-angle lift check reads every bare-aluminium lift as a failure, so the operator judges by eye)")
-    s = sub.add_parser("stir"); s.add_argument("--iter", required=True)
-    s.add_argument("--snap-args", default="--perceive localhost:5558 --band 0.25,0.56,-0.10,0.35 --hmax 0.10")
-    s.add_argument("--stir-args", default="--max-len 0.06 --min-len 0.06")
-    s.add_argument("--i-have-operator-go", action="store_true")
-    s.add_argument("--planned", default=None, help="run stir number N as planned earlier (no new capture / plan)")
     s = sub.add_parser("busy")
     a = ap.parse_args()
     if a.cmd == "busy":
         b = busy(); print("\n".join(b) if b else "idle"); return
     {"new-iter": cmd_new_iter, "prepare": cmd_prepare, "execute": cmd_execute, "close": cmd_close,
-     "teach": cmd_teach, "batch": cmd_batch, "observe": cmd_observe, "stir": cmd_stir}[a.cmd](a)
+     "teach": cmd_teach, "batch": cmd_batch}[a.cmd](a)
 
 
 if __name__ == "__main__":
