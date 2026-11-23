@@ -125,6 +125,10 @@ def main(argv=None) -> int:
     ap.add_argument("--arm", choices=["left", "right", "both"], default=None,
                     help="どちらの腕で計画するか（既定 GRASP_ARM か left）。both は左右を同時に計算して良い方を選ぶ")
     ap.add_argument("--q-right", default=None, help="右腕の今の角度（lerobot の度）。無ければ GRASP_REST_RIGHT か --q の鏡写し")
+    ap.add_argument("--obstacle-objects", action="store_true",
+                    help="カメラで見た点の粗い箱の代わりに、thor_snap.py --yoloe が残したほかの物（object_alt_*.npy）を 1 つずつ箱にして"
+                         "障害物に入れる（机から物の上端まで・余白 1 cm）。2026-11-23 Shreyan: --ignore-seen では隣の木の丸太に爪が当たり、"
+                         "粗い箱では 37 cm の箱が拾う物ごと覆って計画が立たなかった")
     ap.add_argument("--ignore-seen", action="store_true",
                     help="カメラで見た周りの物（掴む物以外）を障害物に入れない（当たってもよいから目標を拾う）。置き場の物・机・もう片方の腕は見る")
     ap.add_argument("--ik", choices=["pinocchio", "curobo"], default=os.environ.get("GRASP_PLAN_IK", "pinocchio"),
@@ -215,7 +219,7 @@ def main(argv=None) -> int:
     if curobo.enabled() or os.environ.get("GRASP_CUROBO_RIGHT"):
         from grasp.curobo import seen
         # --ignore-seen では障害物にしないので計算しない（0.4 秒・2026-11-23）。run_grasp.py が記録の有無を見るので空で残す
-        P_obs = np.zeros((0, 3)) if a.ignore_seen else seen.seen_points(a.cap_dir, T_bc, obj, n_b, d_b)
+        P_obs = np.zeros((0, 3)) if (a.ignore_seen or a.obstacle_objects) else seen.seen_points(a.cap_dir, T_bc, obj, n_b, d_b)
         np.save(os.path.join(a.cap_dir, seen.POINTS_FILE), P_obs)
 
     def prepare_curobo(side):
@@ -231,14 +235,28 @@ def main(argv=None) -> int:
         fz = float(os.environ.get("GRASP_FLOOR_Z", -d_b / n_b[2]))
         # 撮影時の腕自身の点を消す幅。右の爪の先は休みの姿勢で球から 3〜4.2 cm に写った（2026-11-22・右の爪の球をまだ当てはめ直していない）
         margin = float(armcfg.env("GRASP_SEEN_ARM_MARGIN", side, "0.03"))
-        if a.ignore_seen:  # 2026-11-22: 周りの物に当たってもよいから目標を拾う方針。置き場の物（本体・カメラ・机・もう片方の腕）は見る
+        obj_boxes = None
+        if a.obstacle_objects:
+            import glob as _glob
+            obj_boxes = []
+            for k, f in enumerate(sorted(_glob.glob(os.path.join(a.cap_dir, "object_alt_*.npy")))):
+                pb = np.load(f) @ T_bc[:3, :3].T + T_bc[:3, 3]
+                if len(pb) < 20:
+                    continue
+                lo, hi = np.percentile(pb, 2, axis=0) - 0.01, np.percentile(pb, 98, axis=0) + 0.01
+                lo[2] = min(lo[2], fz)  # 机まで
+                obj_boxes.append({"name": f"obj_{k}", "dims": (hi - lo).round(4).tolist(),
+                                  "pose": ((hi + lo) / 2).round(4).tolist() + [1.0, 0.0, 0.0, 0.0]})
+            curobo.set_obstacle_boxes(obj_boxes)
+            r = {"boxes": obj_boxes, "n_in": 0, "n_after_arm": 0}
+        elif a.ignore_seen:  # 2026-11-22: 周りの物に当たってもよいから目標を拾う方針。置き場の物（本体・カメラ・机・もう片方の腕）は見る
             curobo.set_obstacle_boxes([])
             r = {"boxes": [], "n_in": len(P_obs), "n_after_arm": 0}
         else:
             r = curobo.set_obstacle_points(P_obs, arm_qs, T_bc[:3, 3], fz, arm_margin=margin)
         bf = seen.BOXES_FILE if side == "left" else seen.BOXES_FILE.replace(".json", "_right.json")
         json.dump({"cam_pos": T_bc[:3, 3].tolist(), "floor_z": fz, "arm_qs": arm_qs, "boxes": r["boxes"], "arm": side,
-                   "ignore_seen": bool(a.ignore_seen)},
+                   "ignore_seen": bool(a.ignore_seen), "object_boxes": obj_boxes},
                   open(os.path.join(a.cap_dir, bf), "w"), indent=1)
         print(f"[plan:{side}] cuRobo: カメラで見た障害物の箱 {len(r['boxes'])} 個（点 {r['n_in']} → 腕を消して {r['n_after_arm']}）"
               + "".join(f" {b['name']} 中心 {np.round(b['pose'][:3], 2).tolist()} 大きさ {np.round(b['dims'], 2).tolist()}" for b in r["boxes"]))

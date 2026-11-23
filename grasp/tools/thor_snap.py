@@ -251,6 +251,11 @@ def pick_target(a, img, depth, K, tbc, d):
     cands = []
     n_plane = 0
     n_border = 0
+
+    def _why(i, reason):  # GRASP_SNAP_DEBUG=1 で、どの mask を何で外したかを出す
+        if os.environ.get("GRASP_SNAP_DEBUG"):
+            ys_, xs_ = np.where(full[i])
+            print(f"[snap] mask {i} u {xs_.min()}-{xs_.max()} v {ys_.min()}-{ys_.max()}: 外した（{reason}）", flush=True)
     for i, m in enumerate(full):
         if m.shape != depth.shape:
             m = cv2.resize(m.astype(np.uint8), (depth.shape[1], depth.shape[0]), interpolation=cv2.INTER_NEAREST).astype(bool)
@@ -260,12 +265,14 @@ def pick_target(a, img, depth, K, tbc, d):
         b, fm = a.border_px, full[i]  # 縮める前の mask で見る
         if b > 0 and (fm[:b].any() or fm[-b:].any() or fm[:, :b].any() or fm[:, -b:].any()):
             n_border += 1
+            _why(i, "border")
             continue
         # いちばん大きいつながった領域だけを残す（2026-11-23: バーの mask に重量計の縁の細い切れ端が付き、縁と縁の距離が 0 になった）
         nl, lab, stats, _ = cv2.connectedComponentsWithStats(m.astype(np.uint8), connectivity=8)
         if nl > 2:
             m = lab == (1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA])))
         if m.sum() < 60:
+            _why(i, f"too small after cleanup ({int(m.sum())} px)")
             continue
         z = depth[m]; uu, vv = u[m], v[m]
         P = P_all[m]
@@ -276,11 +283,13 @@ def pick_target(a, img, depth, K, tbc, d):
         # 「光って深度が無い」扱いに落ち、床から 2 cm 浮いた物として候補に戻っていた
         if valid.sum() >= 0.5 * m.sum() and np.mean(np.abs(h[valid]) < a.plane_dist) > a.plane_frac:
             n_plane += 1
+            _why(i, "plane")
             continue
         ok = valid & (h > a.plane_dist) & (h < a.hmax)
         if ok.sum() >= max(60, 0.25 * m.sum()):
             pts, src = P[ok], "depth"
         elif valid.sum() >= 0.5 * m.sum():  # 深度はあるのに、床の上の高さの範囲に点が足りない（--hmax より高い物・腕など）
+            _why(i, f"height (ok {int(ok.sum())}/{int(m.sum())} px between {a.plane_dist}..{a.hmax} m)")
             continue
         else:  # shiny/no-depth top: rays through the mask pixels onto the floor plane raised by the assumed height
             ray = np.stack([(uu - K[0, 2]) / K[0, 0], (vv - K[1, 2]) / K[1, 1], np.ones(len(uu))], 1)
@@ -289,6 +298,7 @@ def pick_target(a, img, depth, K, tbc, d):
         if src == "depth":
             pts = clean_points(pts)  # 旧い切り出し（segment_clusters）と同じ後始末: 4 mm の格子・DBSCAN のいちばん大きいかたまり・外れ値
         if len(pts) < 40:
+            _why(i, f'too few 3D points ({len(pts)})')
             continue
         pb = pts @ T[:3, :3].T + T[:3, 3]
         centroid = pb[:, :2].mean(0)
@@ -296,6 +306,11 @@ def pick_target(a, img, depth, K, tbc, d):
                      "top": float(np.percentile(pts @ n + dd, 90)),
                      "centroid": centroid, "radius": float(np.percentile(np.linalg.norm(pb[:, :2] - centroid, axis=1), 90)),
                      "material": None, "mat_conf": None, "det_conf": float(confs[i])})
+    if os.environ.get("GRASP_SNAP_DEBUG"):
+        for c in cands:
+            ys_, xs_ = np.where(c["mask"])
+            print(f"[snap] 候補 u {xs_.min()}-{xs_.max()} v {ys_.min()}-{ys_.max()} 中心 {np.round(c['centroid'], 3).tolist()} "
+                  f"上端 {c['top']:.3f} 点 {len(c['pts'])} {c['src']}", flush=True)
     if n_border:
         print(f"[snap] yoloe: 画面の縁に掛かるので外した mask {n_border} 個", flush=True)
     if n_plane:
@@ -306,9 +321,11 @@ def pick_target(a, img, depth, K, tbc, d):
         x0, x1, y0, y1 = map(float, a.band.split(","))
         cands = [c for c in cands if x0 < c["centroid"][0] < x1 and y0 < c["centroid"][1] < y1]
     if cands and a.exclude_xy:  # 2026-11-23 Shreyan: この回までに置いた所（run_pipeline.sh --n）。置いた物を拾い直さない
-        done_xy = np.array([[float(v) for v in xy.split(",")] for xy in a.exclude_xy.split(";") if xy.strip()])
+        # "x,y" は --exclude-r、"x,y,r" はその半径（拾えなかった物は 3 cm だけ外す。10 cm だと隣の物まで外れた）
+        ex = [[float(v) for v in xy.split(",")] for xy in a.exclude_xy.split(";") if xy.strip()]
+        done_xy = np.array([e[:2] for e in ex]); rad = np.array([e[2] if len(e) > 2 else a.exclude_r for e in ex])
         before = len(cands)
-        cands = [c for c in cands if np.min(np.linalg.norm(done_xy - c["centroid"], axis=1)) > a.exclude_r]
+        cands = [c for c in cands if np.all(np.linalg.norm(done_xy - c["centroid"], axis=1) > rad)]
         if len(cands) < before:
             print(f"[snap] yoloe: 置いた所にある候補 {before - len(cands)} 個を外した", flush=True)
     segs = getattr(a, "_self_segs", None)

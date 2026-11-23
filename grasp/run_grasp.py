@@ -242,6 +242,12 @@ def main(argv=None, *, robot=None, plan_wait=None, t_trigger=None) -> int:
             print("[run] cuRobo: カメラの障害物の記録が無い（置き場の物だけで見る）", flush=True)
             return
         meta = json.load(open(jf))
+        if meta.get("object_boxes") is not None:  # plan.py --obstacle-objects: ほかの物を 1 つずつ箱で（全区間で障害物）
+            tgt["seen"] = list(meta["object_boxes"])
+            CUROBO.set_obstacle_boxes(tgt["seen"])
+            print(f"[run] cuRobo: ほかの物の箱 {len(tgt['seen'])} 個" + "".join(
+                f"・{b['name']} 中心 {np.round(b['pose'][:3], 2).tolist()} 大きさ {np.round(b['dims'], 2).tolist()}" for b in tgt["seen"]), flush=True)
+            return
         if meta.get("ignore_seen"):  # plan.py --ignore-seen: カメラで見た物は障害物にしない（置き場の物・机・もう片方の腕は見る）
             CUROBO.set_obstacle_boxes([])
             print("[run] cuRobo: カメラで見た物は障害物に入れない（plan.py --ignore-seen・置き場の物と机だけで見る）", flush=True)

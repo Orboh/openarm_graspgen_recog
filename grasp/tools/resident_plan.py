@@ -51,19 +51,57 @@ class Camera:
         self.serial = serial
         for _ in range(warmup):  # 自動露出が落ち着くまで捨てる（最初に一度だけ）
             self.pipe.wait_for_frames()
+        import threading
+        self.lock = threading.Lock()  # 撮影（grab）と録画のスレッドが同じ pipeline を読むので、1 度に 1 つだけ
+        self.rec = None
+
+    def start_record(self, path: str, fps: int = 15):
+        """胸のカメラの色を path（mp4）に録り始める（2026-11-23 Shreyan: 選別の回を丸ごと録る）。撮影の間だけ途切れる。"""
+        import threading
+        import cv2
+        self.stop_record()
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        vw = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (640, 480))
+        st = {"path": path, "stop": False, "n": 0, "t0": time.time()}
+
+        def loop():
+            k = 0
+            while not st["stop"]:
+                with self.lock:
+                    fs = self.pipe.wait_for_frames()
+                k += 1
+                if k % max(1, round(30 / fps)) == 0:
+                    vw.write(np.asanyarray(fs.get_color_frame().get_data()))
+                    st["n"] += 1
+            vw.release()
+
+        st["thread"] = threading.Thread(target=loop, daemon=True)
+        st["thread"].start()
+        self.rec = st
+        return {"recording": path}
+
+    def stop_record(self):
+        """録画を止めて mp4 を閉じる。録っていなければ何もしない。"""
+        st, self.rec = self.rec, None
+        if not st:
+            return {"recording": None}
+        st["stop"] = True
+        st["thread"].join(timeout=5)
+        return {"recorded": st["path"], "frames": st["n"], "seconds": round(time.time() - st["t0"], 1)}
 
     def grab(self, frames: int = 4):
         """色 (H,W,3)・深度 [m]・K・内部パラメータの辞書。時間方向のフィルタは毎回作り直す（前の撮影を混ぜない）。"""
         rs = self.rs
         to_disp, to_depth = rs.disparity_transform(True), rs.disparity_transform(False)
         spatial, temporal, holes = rs.spatial_filter(), rs.temporal_filter(), rs.hole_filling_filter(1)
-        self.pipe.wait_for_frames()  # 合図の前にたまった古い 1 組を捨てる
-        depth_f = color_f = None
-        for _ in range(frames):
-            fs = self.align.process(self.pipe.wait_for_frames())
-            color_f = fs.get_color_frame()
-            d = to_disp.process(fs.get_depth_frame())
-            depth_f = holes.process(to_depth.process(temporal.process(spatial.process(d))))
+        with self.lock:
+            self.pipe.wait_for_frames()  # 合図の前にたまった古い 1 組を捨てる
+            depth_f = color_f = None
+            for _ in range(frames):
+                fs = self.align.process(self.pipe.wait_for_frames())
+                color_f = fs.get_color_frame()
+                d = to_disp.process(fs.get_depth_frame())
+                depth_f = holes.process(to_depth.process(temporal.process(spatial.process(d))))
         i = color_f.profile.as_video_stream_profile().intrinsics
         K = np.array([[i.fx, 0, i.ppx], [0, i.fy, i.ppy], [0, 0, 1]], dtype=np.float64)
         intr = {"width": i.width, "height": i.height, "fx": i.fx, "fy": i.fy, "ppx": i.ppx, "ppy": i.ppy,
@@ -72,6 +110,7 @@ class Camera:
                 np.asanyarray(depth_f.get_data()).astype(np.float32) * self.scale, K, intr)
 
     def close(self):
+        self.stop_record()
         self.pipe.stop()
 
 
@@ -109,10 +148,11 @@ def call_main(mod, argv):
     return rc, buf.getvalue()
 
 
-def serve(addr, snap, process):
+def serve(addr, snap, process, cam=None):
     """REP の口で頼みごとを 1 つずつ受ける（json）。
     {"op": "capture"} → 撮って保存 → {"cap": <回のフォルダ>, "name", "times"}
     {"op": "plan", "name": <回の名前>, "q": "j1,...,j7"} → 切り出し・計画・置き先 → {"cap", "planned", "place", "summary", "times", "total_s"}
+    {"op": "record_start", "path": <mp4>, "fps": 15} → 胸のカメラを録り始める・{"op": "record_stop"} → 止めて閉じる
     {"op": "ping"} → {"ok": true}。失敗は {"error": "..."}（腕を動かす側は計画が立たなかったとみなす）"""
     import zmq
     sock = zmq.Context.instance().socket(zmq.REP)
@@ -130,6 +170,12 @@ def serve(addr, snap, process):
                 name, tt = snap()
                 rep = {"cap": os.path.join(RUNS, name), "name": name, "times": tt, "t0": t0}
                 print(f"[resident] capture {name}（{time.time() - t0:.2f} 秒）", flush=True)
+            elif op == "record_start" and cam is not None:
+                rep = cam.start_record(req["path"], int(req.get("fps", 15)))
+                print(f"[resident] 録画を始めた: {req['path']}", flush=True)
+            elif op == "record_stop" and cam is not None:
+                rep = cam.stop_record()
+                print(f"[resident] 録画を止めた: {rep}", flush=True)
             elif op == "plan":
                 k += 1
                 rep = process(k, req["name"], {}, time.time(), q=req.get("q"), q_right=req.get("q_right"))
@@ -378,7 +424,7 @@ def main() -> int:
 
     try:
         if a.serve:
-            serve(a.serve, snap, process)
+            serve(a.serve, snap, process, cam)
         elif a.trigger_dir:
             td = os.path.expanduser(a.trigger_dir)
             os.makedirs(td, exist_ok=True)
