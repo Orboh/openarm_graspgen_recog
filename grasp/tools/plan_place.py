@@ -63,7 +63,20 @@ def _main(argv=None, lm_only: bool = False) -> int:
                     help="物の机に沿った外形の縦横の比が 1.6 未満（丸い・四角い）なら --any-yaw、長い物は ±30° だけ試す（2026-11-23・どんな物でも）")
     ap.add_argument("--any-yaw", action="store_true",
                     help="--to でも置く向きを一回り（15° ごと）試す（立てた丸太など向きを問わない物・2026-11-23）")
+    ap.add_argument("--by-material", action="store_true",
+                    help="--to を <cap_dir>/pick.json の材質（thor_snap.py --yoloe が書く）から選ぶ: "
+                         "metal→右、wood→左、それ以外（composite 等）→前方、どれもカメラの画面の外へ "
+                         "(grasp/classification.py の ROUTE_OFFSET)。--to・--at を指定したときは使わない")
     a = ap.parse_args(argv)
+    if a.by_material and not a.to and not a.at:
+        from grasp.classification import ROUTE_OFFSET
+        pick_path = os.path.join(a.cap_dir, "pick.json")
+        if not os.path.exists(pick_path):
+            raise SystemExit(f"[place] --by-material: {pick_path} が無い（thor_snap.py --yoloe を先に通す）")
+        material = json.load(open(pick_path))["chosen"]["material"]
+        dx, dy = ROUTE_OFFSET.get(material, ROUTE_OFFSET["composite"])
+        a.to = f"{dx},{dy}"
+        print(f"[place] --by-material: {material} → --to {a.to}")
     rng = np.random.default_rng(a.seed)
     plan = json.load(open(os.path.join(a.cap_dir, "plan.json")))
     side = plan.get("arm", "left")  # 2026-11-22: 右腕の計画でも置き先を作る

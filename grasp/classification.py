@@ -2,7 +2,18 @@ from transformers import AutoTokenizer, AutoModel, AutoProcessor, pipeline
 import torch 
 import numpy as np
 
-candidates=["plastic", "wood", "metal", "glass", "ceramic", "paper", "fabric", "rubber", "stone", "cardboard", "foam", "carbon fiber", "composite material"]
+candidates = ["metal", "wood", "composite"]
+
+# grasp/tools/plan_place.py --by-material: where to carry each material, as a --to dx,dy offset [m] from the
+# object's own current spot (base frame; right is negative y, per plan_place.py's own convention). Anything
+# classify_material returns that isn't a key here (shouldn't happen with the 3-class list above, but a model
+# swap or a mis-classification could) falls back to "composite"'s offset.
+ROUTE_OFFSET = {
+    "metal": (0.0, -0.25),       # right, out of the chest camera's frame
+    "wood": (0.0, 0.25),         # left, out of the chest camera's frame
+    "composite": (0.20, 0.0),    # further from the robot base -- assumed to exit the top of the frame; unverified
+                                  # against the real camera mount, check before trusting it on hardware
+}
 model_id="google/siglip2-so400m-patch14-384"
 processor = AutoProcessor.from_pretrained(model_id)
 model = AutoModel.from_pretrained(model_id, device_map="auto", torch_dtype="auto")
