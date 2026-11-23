@@ -1,0 +1,22 @@
+# 開始姿勢セット。scripts/pose_set.py が読み書きする（1 行 1 キー・入れ子なし）。書式と運用は config/pose_sets/README.md
+name: shinshu-takeei-cart-v1
+status: draft
+created_at: 2026-11-17 11:43
+derived_from: ~/poses/shinshu-takeei-cart-v1
+arms: both
+pose_right_sha: 41e4bd5b79bb
+calib_follower_left: a6497c782842
+calib_follower_right: 63f755d3e9ad
+calib_leader_left: 99559b731c6e
+calib_leader_right: 142fc7aeb245
+calib_status: ok
+code_openarm_orboh: 626ab7cc+dirty
+code_lerobot: a720ec19
+synced_at: 2026-11-17 14:35
+pose_left_sha: 2086c95c1df8
+models: ft_bi_openarm_ti_alframe_t1-mix_v1-ckpt10000-thor
+model.ft_bi_openarm_ti_alframe_t1-mix_v1-ckpt10000-thor.dir: ~/models/ft_bi_openarm_ti_alframe_t1-mix_v1/checkpoint-10000
+model.ft_bi_openarm_ti_alframe_t1-mix_v1-ckpt10000-thor.lang: Pick up the aluminum frame and put it aside
+model.ft_bi_openarm_ti_alframe_t1-mix_v1-ckpt10000-thor.added: 2026-11-17
+model.ft_bi_openarm_ti_alframe_t1-mix_v1-ckpt10000-thor.note: 信州タケエイ・台車での試験用（北九州の alframe T1-mix v1 をそのまま・2026-11-17 Sota）
+current_model: ft_bi_openarm_ti_alframe_t1-mix_v1-ckpt10000-thor

@@ -1,0 +1,13 @@
+# right arm standby pose (lerobot deg). 2026-11-22 Sota: 初期位置（home v5）と作業の間に待機位置を置く。台車にぶつからないよう
+# まず手を前に出してから作業を始める。home v4 の手先を 6 cm 上げた姿勢（爪先はロボットから約 0.22 m 前・床から約 0.29 m・手は前向き）。
+# 台車の板から 3〜7 cm、体から 3 cm（grasp/arm_collision.py）。MuJoCo のプレビューを宮嶋が見て OK（grasp/runs/sim/standby_preview.mp4）。
+align:
+  max_speed_dps: 15.0
+joint_1: -61.8
+joint_2: -0.1
+joint_3: 5.1
+joint_4: 136.3
+joint_5: 2.1
+joint_6: 0.5
+joint_7: 23.3
+gripper: 0.0

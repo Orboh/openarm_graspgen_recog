@@ -1,0 +1,15 @@
+{
+  "_note": "2026-11-21 北九州の収集機の左リーダーに付けたグリッパー（作業者 Munenori・Kota の PC の Claude Code から）。指は東京と同じ so101 のフィンレイ指（厚み 35 mm・面の長さ 110 mm）。手首の先の面（手の取り付け面）から指先まで 140 mm（東京と同じ）、全開の指先の間 80 mm（東京は 110 mm）（定規で実測）。J8 は全開 -62.6 deg・全閉 +0.8 deg（脱力したまま手で開閉して CAN で読んだ）。手の取り付け面の位置（link7 の z 0.0895 m）は URDF の値のまま。TCP は東京と同じく指先から 15 mm 手前。手で教えた TCP（tcp_in_link7_taught_m）はまだ無い。東京の爪は grasp/config/openarm_left_gripper.json",
+  "max_opening_m": 0.08,
+  "min_opening_m": 0.0,
+  "gripper_deg_open": -62.6,
+  "gripper_deg_closed": 0.8,
+  "flange_to_tip_m": 0.14,
+  "tcp_offset_from_link7_m": [
+    0.0,
+    0.0,
+    0.2145
+  ],
+  "hand_mount_face_z_in_link7_m": 0.0895,
+  "jaw_tip_z_in_link7_m": 0.2295
+}

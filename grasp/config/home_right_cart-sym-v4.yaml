@@ -1,0 +1,13 @@
+# 右腕の初期姿勢（lerobot の度）。home_left_cart-sym-v4.yaml の鏡（ik/openarm_right_ik.py mirror_q）。
+# 2026-11-21 Sota: 左腕では向きの合わないバーを右腕で掴むため。右腕は 11/21 21:00 にほぼこの姿勢で止まっていた
+# （-56.1, -0.8, 6.6, 106.1, 6.9, 6.0, 48.2）。
+align:
+  max_speed_dps: 15.0
+joint_1: -53.9
+joint_2: 0.0
+joint_3: 4.0
+joint_4: 118.7
+joint_5: 1.0
+joint_6: 0.2
+joint_7: 33.0
+gripper: 0.0

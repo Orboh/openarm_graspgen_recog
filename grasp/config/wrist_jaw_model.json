@@ -1,0 +1,59 @@
+{
+  "_note": "left D405 (409122272149) on the OpenArm left gripper, color-aligned depth 640x480. Jaw inner-tip positions in the camera frame with the gripper open at lerobot -60 deg, measured 2026-11-20 from cap_20261120_191052/probe_wrist_*. The jaws are rigid in this camera, so these are constants.",
+  "serial": "409122272149",
+  "intrinsics": {
+    "fx": 391.44854736328125,
+    "fy": 390.4334411621094,
+    "ppx": 315.3040771484375,
+    "ppy": 237.1416015625,
+    "w": 640,
+    "h": 480,
+    "model": "distortion.inverse_brown_conrady",
+    "coeffs": [
+      -0.05146143212914467,
+      0.056767888367176056,
+      -0.00023674020485486835,
+      0.0002843929105438292,
+      -0.018517108634114265
+    ]
+  },
+  "left_tip_cam_m": [
+    -0.0378,
+    -0.0296,
+    0.1235
+  ],
+  "right_tip_cam_m": [
+    0.0551,
+    -0.0282,
+    0.1264
+  ],
+  "mid_tips_cam_m": [
+    0.0086,
+    -0.0289,
+    0.125
+  ],
+  "left_tip_px": [
+    195,
+    143
+  ],
+  "right_tip_px": [
+    485,
+    150
+  ],
+  "approach_cam": [
+    -0.0131,
+    -0.7895,
+    0.6136
+  ],
+  "closing_cam": [
+    0.9993,
+    0.0104,
+    0.0348
+  ],
+  "thickness_cam": [
+    -0.0339,
+    0.6136,
+    0.7889
+  ],
+  "_axes_note": "approach = mean principal axis of the two jaws' 3D rib points (toward the tips); closing = left->right tip, orthogonalised; thickness = approach x closing. Grasp frame mapping (plan.py T_L7_G): Xg = +closing, Yg = +thickness, Zg = +approach (checked by a +Xg jog on iter_014/016 data: closing offset -20 mm per +15 mm)."
+}

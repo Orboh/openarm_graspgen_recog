@@ -1,0 +1,107 @@
+# OpenArm 開始姿勢 -- side=right, degrees (logical・follower)。
+# 2026-11-17 14:35 scripts/pose_from_dwell.py で生成: right_path_20261117T053310Z.csv の一番長い静止区間 t=7.9〜32.3s（24.3s）の中央値。
+# waypoints = その直前の経路（t=0.0〜7.9s）を RDP で間引いた点（直線と実経路のずれ ≤ 5.0°）。
+# 整列は現在姿勢から waypoints を順にたどり、最後にこの開始姿勢へ入る（関節空間の直線補間・衝突判定なし）。
+# gripper は較正ゼロに固定（起動時の非ゼロ把持指令で follower gripper を壊した事故による約束）。
+align:
+  max_speed_dps: 40.0
+waypoints:
+  - joint_1: 27.73
+    joint_2: 4.36
+    joint_3: 7.05
+    joint_4: 22.82
+    joint_5: 9.92
+    joint_6: 6.58
+    joint_7: 52.21
+  - joint_1: 57.92
+    joint_2: 0.99
+    joint_3: 7.05
+    joint_4: 21.86
+    joint_5: 9.04
+    joint_6: 6.58
+    joint_7: 27.82
+  - joint_1: 75.60
+    joint_2: 0.89
+    joint_3: 7.05
+    joint_4: 8.98
+    joint_5: 9.09
+    joint_6: 6.60
+    joint_7: 23.20
+  - joint_1: 78.11
+    joint_2: 0.86
+    joint_3: 7.05
+    joint_4: 9.29
+    joint_5: 12.10
+    joint_6: 6.58
+    joint_7: 15.27
+  - joint_1: 84.98
+    joint_2: 0.60
+    joint_3: 7.05
+    joint_4: 18.49
+    joint_5: 15.12
+    joint_6: 6.58
+    joint_7: 6.27
+  - joint_1: 83.56
+    joint_2: 0.25
+    joint_3: 7.05
+    joint_4: 19.48
+    joint_5: 15.51
+    joint_6: 6.58
+    joint_7: 11.58
+  - joint_1: 74.94
+    joint_2: 0.05
+    joint_3: 7.05
+    joint_4: 25.88
+    joint_5: 15.07
+    joint_6: 6.58
+    joint_7: 11.45
+  - joint_1: 62.55
+    joint_2: -1.21
+    joint_3: 7.05
+    joint_4: 42.29
+    joint_5: 15.12
+    joint_6: 6.53
+    joint_7: 3.62
+  - joint_1: 39.51
+    joint_2: -2.92
+    joint_3: 7.05
+    joint_4: 66.09
+    joint_5: 14.86
+    joint_6: 6.55
+    joint_7: 4.37
+  - joint_1: 31.78
+    joint_2: -2.92
+    joint_3: 7.03
+    joint_4: 71.36
+    joint_5: 13.61
+    joint_6: 6.60
+    joint_7: 13.09
+  - joint_1: 10.90
+    joint_2: -2.74
+    joint_3: 7.05
+    joint_4: 98.27
+    joint_5: 16.74
+    joint_6: 6.55
+    joint_7: -8.29
+  - joint_1: -27.67
+    joint_2: 2.33
+    joint_3: 8.12
+    joint_4: 133.55
+    joint_5: 29.24
+    joint_6: 6.55
+    joint_7: -12.88
+  - joint_1: -41.55
+    joint_2: 6.96
+    joint_3: 10.81
+    joint_4: 137.17
+    joint_5: 26.27
+    joint_6: 8.17
+    joint_7: -13.76
+joint_1: -41.66
+joint_2: 8.60
+joint_3: 10.75
+joint_4: 136.10
+joint_5: 21.28
+joint_6: 8.11
+joint_7: -13.69
+gripper: 0.0

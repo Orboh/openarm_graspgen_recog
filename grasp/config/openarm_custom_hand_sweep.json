@@ -1,0 +1,24 @@
+{
+  "_note": "OpenArm left gripper (jaw = \u9f4a\u85e4's left-jaw.step, ~48x62x38 mm). Measured 2026-11-20: tip gap 110 mm fully open (J8 -66 deg), 0 mm closed (0 deg); wrist flange -> jaw tip 140 mm. Gripper base = wrist flange, +Z approach, +X closing, metres. extents_*[1] (finger thickness) and [2] (grasp length) are approximate from the CAD outline; re-measure if grasps look off. 2026-11-20 night: re-measured from \u9f4a\u85e4's so101-finger.step (the jaw actually mounted, fin-ray 110 x 35.3 x 39 mm, flat contact face along the full 110 mm): finger width 35.3 mm, grasp length 80 mm (tip back to 30 mm before the root, which sits by the carriage), centre 100 mm from the flange. Old: width 38, length 45, centre 117.5 (kept in openarm_custom_hand_sweep.bak-20261120.json).",
+  "extents_open": [
+    0.11,
+    0.0353,
+    0.08
+  ],
+  "offset_open": [
+    0.0,
+    0.0,
+    0.1
+  ],
+  "extents_mid": [
+    0.055,
+    0.0353,
+    0.08
+  ],
+  "offset_mid": [
+    0.0,
+    0.0,
+    0.1
+  ],
+  "fingertip_depth": 0.14
+}

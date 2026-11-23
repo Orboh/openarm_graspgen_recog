@@ -1,0 +1,24 @@
+{
+  "_note": "2026-11-21 北九州の収集機の左リーダーのグリッパーを GraspGenX に渡す爪の箱（作業者 Munenori・Kota の PC の Claude Code から）。指は東京と同じ so101 のフィンレイ指（厚み 35 mm・面の長さ 110 mm・手首の先の面から指先 140 mm）なので、厚み・掴む長さ・中心の位置は東京（grasp/config/openarm_custom_hand_sweep.json）と同じ。違うのは開いた幅だけ: 全開 80 mm（東京 110 mm）、半開き 40 mm。手の座標: 手首の先の面が原点、+Z が近づく向き、+X が閉じる向き、単位 m",
+  "extents_open": [
+    0.08,
+    0.0353,
+    0.08
+  ],
+  "offset_open": [
+    0.0,
+    0.0,
+    0.1
+  ],
+  "extents_mid": [
+    0.04,
+    0.0353,
+    0.08
+  ],
+  "offset_mid": [
+    0.0,
+    0.0,
+    0.1
+  ],
+  "fingertip_depth": 0.14
+}

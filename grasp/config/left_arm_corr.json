@@ -1,0 +1,44 @@
+{
+ "model": "cam+joints",
+ "joint_offsets_deg": [
+  -0.004,
+  -2.224,
+  -1.442,
+  -2.164,
+  0.588,
+  0.969,
+  -4.413
+ ],
+ "camera_delta": {
+  "rotvec": [
+   0.030623,
+   -0.014005,
+   0.06967
+  ],
+  "t_m": [
+   0.00893,
+   0.01224,
+   -0.01204
+  ]
+ },
+ "held_out_median_mm": 5.4,
+ "held_out_p90_mm": 8.1,
+ "uncorrected_held_out_median_mm": 19.7,
+ "per_set_median_mm": {
+  "hn_135208": 4.6,
+  "hn_161236": 7.2,
+  "hn_162408": 5.8
+ },
+ "uncorrected_per_set_median_mm": {
+  "hn_135208": 3.0,
+  "hn_161236": 26.5,
+  "hn_162408": 23.5
+ },
+ "detections": 54,
+ "sources": [
+  "hn_135208",
+  "hn_161236",
+  "hn_162408"
+ ],
+ "note": "2026-11-22 16:24 left-arm correction (Sota: \u5de6\u624b\u3092\u4f7f\u3048\u308b\u3088\u3046\u306b\u3057\u3088). actual = LC * model(q + joint_offsets): ik/openarm_left_ik.py reads it. Fitted by grasp/tools/fit_left_arm_corr.py from 54 wrist-marker views (13:52 hand-eye poses + 16:12/16:24 tilted-jaw poses), camera T_base_cam.json of 13:55 unchanged. held-out median 19.7 -> 5.4 mm. GRASP_LEFT_CORR=none turns it off."
+}

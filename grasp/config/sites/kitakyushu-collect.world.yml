@@ -1,0 +1,25 @@
+# 北九州の収集機で、cuRobo に入れる左腕の周りの物（grasp/curobo/model.py の load_world が読む）。
+# 2026-11-21 作業者 Munenori（Kota の PC の Claude Code から）。
+# 座標は腕の付け根（URDF の world・plan.py の base と同じ）[m]。pose は [x, y, z, qw, qx, qy, qz]（cuRobo と同じ wxyz）。
+# 机の板は GRASP_FLOOR_Z を上の面にした箱で自動で足す（table: false で外す）。
+# 腕・指・手の本体の形は cuRobo の球で入っているので、ここには物そのものの大きさを書く（腕の太さの分を広げない）。
+
+table: true
+
+mesh:
+  # 本体のフレーム。北九州は OpenArm 純正の本体で、胸のカメラもこれに付いている（2026-11-21 Munenori）。
+  # 16:03 に持ち上げの段で肘が当たったのもこれ。URDF の openarm_body_link0 の形（原点は world と同じ）
+  body:
+    file: grasp/curobo/meshes/body_link0_symp.stl
+    scale: 0.001
+    pose: [0, 0, 0, 1, 0, 0, 0]
+    ignore_links: [openarm_left_link0]   # 本体にねじ止めしてある腕の付け根は、いつも本体に触れている
+
+cuboid:
+  # 胸のカメラ（D435i・幅 90 × 高さ 25 × 奥行き 25 mm）。位置と向きはハンドアイ（kitakyushu-collect.T_base_cam.json）、
+  # 中心は光学原点からカメラの向きに 12.5 mm 後ろ。カラーのレンズが中心から横にずれている分、幅を 100 mm にした。
+  # 2026-11-21 19:1x にカメラを高く・下向きに付け替えた（上 0.926 m）ので、取り直したハンドアイで置き直した。
+  # 付け替えた金具の形はまだ入れていない（カメラより上にあり、腕は届かないと見ている）。前の位置（上 0.53 m）での実測の照合: 腕の付け根から前に 1 cm・カメラの上面が付け根の下面から 10 cm 下
+  chest_camera:
+    dims: [0.10, 0.025, 0.025]
+    pose: [0.0427, 0.0343, 0.9377, 0.1139, -0.6817, 0.7125, -0.1206]

@@ -1,0 +1,22 @@
+{
+ "rotvec": [
+  0.003480489390974962,
+  0.05865209956321441,
+  -0.04213943956813915
+ ],
+ "t_m": [
+  -0.04376761908568719,
+  0.013922855600919689,
+  -0.0005285653614311212
+ ],
+ "marker_ee_m_fit": [
+  0.061591011971348135,
+  0.004516192561480891,
+  0.06695112295689798
+ ],
+ "n": 19,
+ "median_before_m": 0.015121082206330416,
+ "median_after_m": 0.0017042925623618355,
+ "method": "2026-11-21 21:24 right-arm check: 25 poses (mirror of the left recal poses), one id0 marker on the right hand, chest camera fixed (T_base_cam.json of 20:32). Fitted actual = R*model + t for the whole right arm plus the marker offset (soft_l1). 19 detections.",
+ "use": "ik/openarm_right_ik.py applies it: fk() returns actual poses, solve() aims the model at the corrected target"
+}

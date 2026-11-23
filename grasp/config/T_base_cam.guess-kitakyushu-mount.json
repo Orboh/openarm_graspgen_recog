@@ -1,0 +1,41 @@
+{
+ "T_base_cam": [
+  [
+   0.0,
+   0.9342897925074491,
+   0.3554034096859335,
+   0.09820569622766132
+  ],
+  [
+   0.998934265112766,
+   0.008333654102187234,
+   -0.021907634394509098,
+   0.04980113035950211
+  ],
+  [
+   -0.023429888275835472,
+   0.3553056906745128,
+   -0.9340329073104701,
+   0.8442220198067074
+  ],
+  [
+   0.0,
+   0.0,
+   0.0,
+   1.0
+  ]
+ ],
+ "markers_link7_m": [
+  [
+   0.0021464110322369436,
+   0.06519709608303527,
+   0.15935691293845528
+  ],
+  [
+   0.07852500908423526,
+   -0.0033200357375192404,
+   0.0961818543930311
+  ]
+ ],
+ "note": "2026-11-22 initial guess after the chest camera went onto the Kitakyushu mount: 0.577 m above the floor, optical axis 18.7 deg from straight down toward +x, image top = robot side (image right = base +y), x,y = Kitakyushu. NOT a calibration: only for choosing hand-eye poses. x shifted +0.08 m so the cart front edge (x 0.155, z 0.42) falls on image row ~105 as seen."
+}

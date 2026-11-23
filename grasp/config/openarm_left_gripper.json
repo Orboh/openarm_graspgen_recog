@@ -1,0 +1,31 @@
+{
+ "_note": "Measured 2026-11-20 on the real left arm (Thor can_fol_l). Flange = hand mount face, which sits at z=89.5 mm in the openarm_left_link7 frame (from the URDF hand mesh). Jaw tip = flange + 140 mm = 229.5 mm from link7 origin (URDF stock fingertip is 183 mm, so these jaws are ~47 mm longer). TCP = 15 mm back from the tips = 214.5 mm. Raw J8 angle (no power): closed +6.1 deg, open -66 deg (110 mm tip gap). 2026-11-20 taught: block centred between the open jaws by hand \u2192 TCP in link7 = (0.022, -0.010, 0.210) m (model said (0,0,0.2145)); plan.py uses the taught value. 2026-11-20 22:40: the taught TCP was recomputed with the refit chest camera (config/T_base_cam.json): (0.0082, -0.0031, 0.2203) m, i.e. on the wrist axis within 1 cm and close to the measured (0,0,0.2145). The old (0.022,-0.010,0.210) had absorbed the 2.4 deg camera error.",
+ "max_opening_m": 0.11,
+ "min_opening_m": 0.0,
+ "gripper_deg_open": -66.0,
+ "gripper_deg_closed": 6.1,
+ "flange_to_tip_m": 0.14,
+ "tcp_offset_from_link7_m": [
+  0.0,
+  0.0,
+  0.2145
+ ],
+ "hand_mount_face_z_in_link7_m": 0.0895,
+ "jaw_tip_z_in_link7_m": 0.2295,
+ "tcp_in_link7_taught_m": [
+  0.0082,
+  -0.0301,
+  0.2203
+ ],
+ "tcp_in_link7_taught_old_m": [
+  0.022,
+  -0.01,
+  0.21
+ ],
+ "tcp_in_link7_taught_before_1650_m": [
+  0.0082,
+  -0.0031,
+  0.2203
+ ],
+ "_note_1650": "2026-11-22 16:55: the wrist camera right before closing (cap_20261122_165012/wrist_at_grasp.jpg) showed the bar 27 mm toward the right jaw (+closing = +Xg = link7 +y) from the jaw centre, the same side and size as at 10:31 (before the left-arm correction). The jaw centre is 27 mm on link7 -y of the old taught value: y -0.0031 -> -0.0301."
+}

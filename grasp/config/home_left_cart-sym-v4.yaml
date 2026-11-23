@@ -1,0 +1,11 @@
+# 2026-11-19 Sota: 台車用・左右対称。右は v3 の目標、左はその鏡（左 = −j1, −j2, −j3, +j4, −j5, −j6, −j7）。経由地なし・直行 15 deg/s
+align:
+  max_speed_dps: 15.0
+joint_1: 53.9
+joint_2: 0.0
+joint_3: -4.0
+joint_4: 118.7
+joint_5: -1.0
+joint_6: 0.2
+joint_7: -33.0
+gripper: 0.0

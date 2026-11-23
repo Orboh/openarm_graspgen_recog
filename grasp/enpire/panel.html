@@ -1,0 +1,256 @@
+<!doctype html><html lang="ja"><head><meta charset="utf-8"><title>ENPIRE 操作パネル</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root{--bg:#f7f7f5;--fg:#1d1d1b;--mut:#6b6b66;--card:#fff;--line:#e3e2dd;--ok:#1a7f37;--ng:#c62828;--warn:#b26a00;--acc:#2f5bd3;--go:#c62828;--in:#fbfbfa}
+@media (prefers-color-scheme:dark){:root{--bg:#161615;--fg:#ecebe6;--mut:#9a9993;--card:#1f1f1d;--line:#33322f;--ok:#4cc26a;--ng:#ef6b6b;--warn:#f0a940;--acc:#7d9bf0;--go:#e04848;--in:#191918}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,sans-serif}
+main{max-width:1280px;margin:0 auto;padding:16px;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px}
+@media (max-width:900px){main{grid-template-columns:1fr}}
+header{grid-column:1/-1;display:flex;flex-wrap:wrap;align-items:center;gap:8px 16px}
+h1{font-size:19px;margin:0} h2{font-size:15px;margin:0 0 8px} .mut{color:var(--mut)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px}
+.full{grid-column:1/-1}
+label{display:block;margin:6px 0 2px;color:var(--mut);font-size:12px}
+input,textarea,select{width:100%;font:13px ui-monospace,monospace;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--in);color:var(--fg)}
+textarea{min-height:56px;resize:vertical;font-family:system-ui,sans-serif}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:end}.row>*{flex:1;min-width:120px}
+button{font:600 13px system-ui;padding:7px 14px;border-radius:7px;border:1px solid var(--line);background:var(--card);color:var(--fg);cursor:pointer}
+button:hover:not(:disabled){border-color:var(--acc)} button:disabled{opacity:.45;cursor:not-allowed}
+button.pri{background:var(--acc);border-color:var(--acc);color:#fff}
+button.go{background:var(--go);border-color:var(--go);color:#fff;font-size:15px;padding:9px 18px}
+.chips{display:flex;gap:4px;flex-wrap:wrap;margin-top:4px}.chips span{font:11px ui-monospace,monospace;border:1px solid var(--line);border-radius:10px;padding:1px 7px;cursor:pointer;color:var(--mut)}
+.chips span:hover{color:var(--acc);border-color:var(--acc)}
+.pill{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;border:1px solid var(--line)}
+.ok{color:var(--ok)}.ng{color:var(--ng)}.wn{color:var(--warn)}
+.log{font:12px/1.4 ui-monospace,monospace;background:var(--in);border:1px solid var(--line);border-radius:6px;padding:8px;height:260px;overflow:auto;white-space:pre-wrap}
+.imgs{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:6px;margin:8px 0}.imgs img{width:100%;border-radius:4px}
+table{border-collapse:collapse;width:100%;font-size:13px} td,th{padding:3px 6px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+.kv{font:12px ui-monospace,monospace;white-space:pre-wrap;color:var(--mut)}
+#toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:var(--fg);color:var(--bg);padding:8px 14px;border-radius:8px;display:none;max-width:90vw}
+#gobox{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:center;justify-content:center;z-index:10;padding:16px}
+#gobox .in{background:var(--card);border-radius:12px;max-width:900px;width:100%;max-height:92vh;overflow:auto;padding:16px}
+#gobox .imgs{grid-template-columns:repeat(auto-fill,minmax(260px,1fr))}
+.big{font-size:17px;padding:12px 22px}
+.steps{display:grid;gap:8px;margin-top:8px}.step{border:1px solid var(--line);border-radius:8px;padding:8px}
+.step h3{font-size:13px;margin:0 0 4px}.step .imgs{grid-template-columns:repeat(auto-fill,minmax(220px,1fr))}
+.bar{display:flex;height:14px;border-radius:4px;overflow:hidden;margin:4px 0}.bar span{display:block;height:100%}
+</style></head><body><main>
+<header><h1>ENPIRE 操作パネル</h1><span class="mut">OpenArm 左腕 · 記録は grasp/runs/enpire/（live.py と同じ）</span>
+<span id="health" class="mut">点検中…</span><button onclick="checkHealth()">点検</button>
+<a href="http://localhost:8765" target="_blank" class="mut">ダッシュボード ↗</a>
+<div id="others" class="pill wn" style="display:none;width:100%;padding:6px 10px"></div></header>
+
+<section class="card">
+<h2>① 撮影だけ（置き方の確認・腕は動かない）</h2>
+<label>thor_snap の引数</label><input id="snap_only" value="--hmax 0.10">
+<div class="chips" data-for="snap_only"></div>
+<div class="row" style="margin-top:8px"><button onclick="run('snap',{snap_args:v('snap_only')})">撮影</button></div>
+<div class="imgs" id="latest"></div>
+</section>
+
+<section class="card">
+<h2>② 新しい回（new-iter）</h2>
+<label>仮説（何を 1 つ変えて、何を確かめるか）</label><textarea id="hypothesis" placeholder="例: GraspNet-baseline でアルミの棒を縦置き、min-score 0.25"></textarea>
+<div class="row"><div><label>把持モデル</label><select id="model" onchange="setModel()"><option value="graspgenx">GraspGenX</option><option value="graspnet">GraspNet-baseline</option></select></div>
+<div><label>試行数の目安（budget）</label><input id="budget" type="number" value="10" min="1"></div></div>
+<label>plan.py の引数（plan_args）</label><input id="plan_args">
+<div class="chips" data-for="plan_args"></div>
+<label>実行時の引数（exec_args）</label><input id="exec_args">
+<div class="row"><div><label>開始姿勢（home）</label><select id="home"></select></div>
+<div><label>executor</label><input id="executor"></div></div>
+<label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="auto_place" style="width:auto"> 持ち上げた後に別の場所へ置き直す（auto-place）</label>
+<div class="row" style="margin-top:8px"><button class="pri" onclick="newIter()">回を開く</button></div>
+</section>
+
+<section class="card full">
+<h2>③ 試行（準備 → 確認 → GO）</h2>
+<div class="row"><div><label>回</label><select id="iter" onchange="pickIter()"></select></div>
+<div style="flex:2"><label>準備時の thor_snap 引数（snap_args）</label><input id="snap_args" value="--hmax 0.10"><div class="chips" data-for="snap_args"></div></div>
+<div><label>置き直し dx,dy [m]（任意）</label><input id="place_offset" placeholder=""></div></div>
+<div id="iterinfo" class="mut" style="margin:6px 0"></div>
+<div class="row"><button class="go big" id="onebtn" onclick="prepareThenAsk()">① 撮って計画 → ② 写真を見て「動かす」（1 回の確認で掴む）</button></div>
+<div class="mut" style="margin:4px 0 8px">腕が動くのは、計画の写真を見て「動かす」を押したときだけ。計画が立たなければ動かずに理由を出す。</div>
+<div class="row"><button class="pri" id="prepbtn" onclick="prepare()">準備だけ（撮影→計画→空打ち・腕は動かない）</button>
+<div><label>試行</label><select id="trial" onchange="loadTrial()"></select></div></div>
+<div id="trialbox" style="margin-top:8px"></div>
+<div class="row" style="margin-top:8px;align-items:center">
+<button class="go" id="gobtn" onclick="execute()" disabled>実行（GO・腕が動く）</button>
+<span class="mut" id="gohint"></span></div>
+<details style="margin-top:10px"><summary>バッチ（準備→実行を繰り返す・3 回続けて失敗で止まる）</summary>
+<div class="row" style="margin-top:6px"><div><label>回数</label><input id="batch_n" type="number" value="10" min="1"></div>
+<button class="go" id="batchbtn" onclick="batch()">バッチ開始（GO）</button><button onclick="post('/api/stop',{}).then(()=>toast('STOP を置きました。今の試行の後で止まります'))">STOP（今の試行の後）</button></div>
+</details>
+</section>
+
+<section class="card">
+<h2>④ 回を締める（close）と所見</h2>
+<label>所見（finding・iteration.json に残る）</label><textarea id="finding" placeholder="例: 縦置きなら深度が取れる。爪が棒の端を押して 35° 回った"></textarea>
+<div class="row" style="margin-top:8px"><button class="pri" onclick="closeIter()">締める（成功率・最良の判定）＋所見を保存</button>
+<button onclick="saveFinding()">所見だけ保存</button></div>
+<h2 style="margin-top:14px">メモ（events.jsonl に残る）</h2>
+<div class="row"><input id="note" placeholder="例: 棒を縦向き、ロボットから 0.41 m、照明そのまま"><button onclick="sendNote()" style="flex:0">記録</button></div>
+</section>
+
+<section class="card">
+<h2>実行中のジョブ <span id="jobstat" class="mut"></span></h2>
+<div class="log" id="log"></div>
+<div class="row" style="margin-top:6px"><button onclick="post('/api/cancel',{}).then(()=>toast('止めました'))" id="cancelbtn">ジョブを止める（準備・撮影のみ）</button></div>
+</section>
+
+<section class="card full">
+<h2>回の一覧</h2><table id="iters"></table>
+<h2 style="margin-top:12px">イベント</h2><div class="log" id="ev" style="height:180px"></div>
+</section>
+</main><div id="toast"></div>
+<div id="gobox"><div class="in"><h2 id="gotitle">この計画で掴みますか？</h2><div id="gosum" class="kv" style="color:var(--fg)"></div>
+<div class="imgs" id="goimgs"></div>
+<div class="row" style="margin-top:10px"><button class="go big" id="gonow" onclick="goNow()">動かす（腕が動く）</button><button class="big" onclick="closeGo()">やめる</button>
+<button class="big" onclick="closeGo();prepareThenAsk()">撮り直して計画し直す</button></div>
+<div class="mut" style="margin-top:6px">ロボットの前と肩の横から離れて、非常停止に手が届く所で押してください。</div></div></div>
+<script>
+const CHIPS={snap_only:["--perceive localhost:5558","--band 0.25,0.56,-0.20,0.35","--hmax 0.10","--chest-preset Hand --no-hole-fill","--exclude-wood","--exclude-bright","--fast"],
+ snap_args:["--perceive localhost:5558","--band 0.25,0.56,-0.20,0.35","--skip-crowded","--hmax 0.10","--chest-preset Hand --no-hole-fill","--exclude-wood","--exclude-bright"],
+ plan_args:["--bar-grasps","--also-graspgenx","--shallow 0.028","--open-mm 50","--avoid-obstacles","--clear-gap","--max-tilt 55","--max-tilt 45","--min-score 0.25","--min-score 0.5","--raise-to-clear 0.025","--center-tol 0.08","--avoid-obstacles","--extra-depth 0.04","--rounds 40"]};
+const PR=["object_found","grasp_found","grasp_on_object","top_down","width_ok","reachable","lifted"];
+let S=null, filled=false, curIter=null, curTrial=null, T=null;
+const $=id=>document.getElementById(id), v=id=>$(id).value;
+const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const pct=x=>x==null?"–":(100*x).toFixed(0)+"%";
+function toast(m){const t=$("toast");t.textContent=m;t.style.display="block";clearTimeout(t._h);t._h=setTimeout(()=>t.style.display="none",4000)}
+async function post(u,b){const r=await fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)});const j=await r.json();if(!r.ok){toast(j.error||"error");throw j}tick();return j}
+function run(cmd,f){return post("/api/run/"+cmd,f).then(()=>toast(cmd+" を始めました"))}
+document.querySelectorAll(".chips").forEach(el=>{const id=el.dataset.for;el.innerHTML=CHIPS[id].map(c=>`<span>${c}</span>`).join("");
+ el.onclick=e=>{if(e.target.tagName!="SPAN")return;const i=$(id),c=e.target.textContent,key=c.split(" ")[0];
+  let parts=i.value.trim();
+  if((c.match(/--/g)||[]).length>1){parts=parts.includes(c)?parts.replace(c,""):parts+" "+c;i.value=parts.replace(/\s+/g," ").trim();return}
+  const re=new RegExp("(^|\\s)"+key.replace(/[-]/g,"\\-")+"(\\s+[^-\\s][^\\s]*)?(?=\\s|$)");
+  if(re.test(parts)) parts=parts.replace(re,(m)=>m.trim()==c?"":" "+c).trim(); else parts=(parts+" "+c).trim();
+  i.value=parts.replace(/\s+/g," ");if(id=="plan_args")syncModel()}});
+function setModel(){let p=v("plan_args").replace(/\s*--model\s+\S+/,"").trim();if(v("model")=="graspnet")p=("--model graspnet "+p).trim();$("plan_args").value=p}
+function syncModel(){$("model").value=/--model\s+graspnet/.test(v("plan_args"))?"graspnet":"graspgenx"}
+$("plan_args").oninput=syncModel;
+function fill(d){if(filled)return;filled=true;if(d.snap_args){$("snap_args").value=d.snap_args;$("snap_only").value=d.snap_args}$("plan_args").value=d.plan_args;$("exec_args").value=d.exec_args;$("executor").value=d.executor;
+ $("home").innerHTML=['<option value="">（なし）</option>',...d.homes.map(h=>`<option>${esc(h)}</option>`)].join("");$("home").value=d.home;$("auto_place").checked=d.auto_place;syncModel()}
+function newIter(){run("new-iter",{hypothesis:v("hypothesis"),budget:v("budget"),plan_args:v("plan_args"),exec_args:v("exec_args"),executor:v("executor"),home:v("home"),auto_place:$("auto_place").checked}).then(()=>{curIter="__new__"})}
+function prepare(){run("prepare",{iter:curIter,snap_args:v("snap_args"),place_offset:v("place_offset")}).then(()=>{curTrial="__new__"})}
+function execute(){if(!T)return;const p=T.plan||{};
+ const msg=`腕が動きます（約 1 分）。\n\n回: ${curIter}\n試行: ${T.name}\nscore ${p.score!=null?(+p.score).toFixed(2):"–"} · 傾き ${p.tilt_deg!=null?(+p.tilt_deg).toFixed(0):"–"}° · 物体まで ${p.tcp_to_object_m!=null?(+p.tcp_to_object_m*100).toFixed(1)+" cm":"–"}\n\nロボットの前に人がいて、非常停止に手が届きますか？`;
+ if(!confirm(msg))return;run("execute",{iter:curIter,trial:parseInt(T.name),confirm:"GO"})}
+function batch(){const n=v("batch_n");if(!confirm(`バッチで ${n} 回、準備→実行を繰り返します（腕が動き続けます）。\n回: ${curIter}\n\nロボットの前に人がいて、非常停止に手が届きますか？`))return;
+ run("batch",{iter:curIter,n,snap_args:v("snap_args"),confirm:"GO"})}
+function closeIter(){if(!confirm(`${curIter} を締めます（成功率を出し、この組の最良と比べます）。`))return;run("close",{iter:curIter,finding:v("finding")})}
+function saveFinding(){post("/api/finding",{iter:curIter,text:v("finding")}).then(()=>toast("所見を保存しました"))}
+function observe(lifted){if(!T)return;const note=prompt((lifted?"持ち上がった":"持ち上がらなかった")+"。メモ（任意）:","")??"";
+ run("observe",{iter:curIter,trial:parseInt(T.name),lifted,note})}
+let askAfterPrep=false;
+function prepareThenAsk(){askAfterPrep=true;run("prepare",{iter:curIter,snap_args:v("snap_args"),place_offset:v("place_offset")}).then(()=>{curTrial="__new__";toast("撮影と計画を始めました（腕は動きません）")}).catch(()=>{askAfterPrep=false})}
+async function afterPrep(){askAfterPrep=false;const m=(S.iters.find(x=>x.iter==curIter)||{trials:[]});const last=m.trials[m.trials.length-1];if(!last)return;
+ const t=await (await fetch(`/api/trial?iter=${curIter}&trial=${parseInt(last.name)}`)).json();T=t;curTrial=String(parseInt(t.name));
+ const ok=t.ready&&t.stage=="prepared";$("gonow").style.display=ok?"":"none";
+ if(!ok){const sts=((t.steps||{}).plan_stats||[]);const adv=sts.filter(x=>x.advice);const pc=(t.steps||{}).perceive;
+  let say,imgs=[];
+  const dcx=(t.steps||{}).decision;
+  if(dcx&&dcx.say){say=dcx.say;imgs=[dcx.img,...adv.map(x=>x.advice_img)].filter(Boolean)}
+  else if(!pc||!pc.chosen){say="アルミの棒が見つからなかった。棒がカメラに写る所（腕の前）にあるか確かめてください。";imgs=pc&&pc.img?[pc.img]:[]}
+  else if(adv.length){say=adv.map((x,i)=>(adv.length>1?`${i+1} 本目: `:"")+x.advice).join("\n");imgs=adv.map(x=>x.advice_img).filter(Boolean)}
+  else if(t.stage=="prepared"&&t.plan){say="掴み方は立ったが、確認の判定で止めた: "+(t.cause||"");imgs=t.imgs.filter(u=>/overlay/.test(u))}
+  else{say="掴み方が見つからなかった。棒の向きか位置を少し変えてください。";imgs=t.imgs.filter(u=>/overlay/.test(u))}
+  $("gotitle").textContent="腕は動かしていません — この置き方では掴めない";
+  $("gosum").innerHTML=`<div style="font:600 16px/1.6 system-ui;color:var(--fg);white-space:pre-wrap">${esc(say)}</div>
+   <div class="mut" style="margin-top:4px">写真: 赤＝狙った棒 · 紫＝隣の硬い物 · 緑の矢印＝動かす向き · 緑の線＝置く向き</div>
+   <details style="margin-top:6px"><summary class="mut">詳しい記録</summary><div class="kv">${esc(t.cause||"")}\n${esc(t.snap||"")}\n${esc((t.plan_log||"").split("\n").filter(l=>/candidates|no candidate|cuRobo: [0-9]|trying/.test(l)).slice(-4).join("\n"))}</div></details>`;
+  $("goimgs").innerHTML=imgs.map(u=>`<a href="${u}" target="_blank"><img src="${u}?${Date.now()}"></a>`).join("");
+  $("gobox").style.display="flex";renderTrial();return}
+ const p=t.plan||{};const dc=(t.steps||{}).decision;
+ $("gotitle").textContent=(dc&&!dc.confident?"⚠ 確認してください（自信が低い） · ":"この計画で掴みますか？ · ")+`${curIter} · ${t.name}`;
+ $("gosum").textContent=`爪の傾き ${(+p.tilt_deg).toFixed(0)}° · score ${(+p.score).toFixed(2)} · 爪先から物まで ${(p.tcp_to_object_m*100).toFixed(1)} cm\n`+
+  ((t.dry_check||"").match(/回り込む[^\n]*/g)||[]).map(x=>"cuRobo: "+x).join("\n")+((t.dry_check||"").includes("回り込む")?"":"cuRobo: 回り込み不要")+
+  (dc?`\n\n何をするか: ${dc.say}`+((dc.why_low||[]).length?`\n要確認: ${dc.why_low.join(" / ")}`:""):"");
+ $("goimgs").innerHTML=[...(dc&&dc.img?[dc.img]:[]),...t.imgs.filter(u=>/overlay|plan/.test(u))].map(u=>`<a href="${u}" target="_blank"><img src="${u}?${Date.now()}"></a>`).join("");
+ $("gobox").style.display="flex"}
+function closeGo(){$("gobox").style.display="none"}
+function goNow(){closeGo();if(!T)return;run("execute",{iter:curIter,trial:parseInt(T.name),confirm:"GO"})}
+function sendNote(){post("/api/note",{iter:curIter,text:v("note")}).then(()=>{$("note").value="";toast("記録しました")})}
+async function checkHealth(){$("health").textContent="点検中…";try{const h=await (await fetch("/api/health")).json();
+ const sv=h.servers||{graspgenx:h.graspgenx};const nm={perceive:"識別 :5558",graspgenx:"GraspGenX :5556",curobo:"cuRobo :5559",vlm:"画像言語モデル :5560"};
+ $("health").innerHTML=Object.entries(sv).map(([k,x])=>`<span class="pill ${x?"ok":"ng"}">${nm[k]} ${x?"OK":"落ちている"}</span>`).join(" ")+(Object.values(sv).every(x=>x)?"":` <button onclick="run('servers',{action:'start'})">サーバー起動</button>`)+` <span class="pill ${h.curobo_env?"ok":"wn"}">cuRobo ${h.curobo_env?"有効":"無効"}</span> <span class="pill">${h.local?"Thor 1 台":"PC→Thor ssh"} · ${esc(h.arm)}腕</span> <span class="pill ${h.thor_ssh?"ok":"ng"}">腕・カメラ ${h.thor_ssh?"OK":"NG"}</span> <span class="pill ${h.busy.length?"wn":"ok"}" title="${esc(h.busy.join("\n"))}">${h.busy.length?"腕・カメラ使用中 ("+h.busy.length+")":"空き"}</span>`}
+ catch(e){$("health").textContent="点検できず"}}
+function pickIter(){curIter=v("iter");curTrial=null;T=null;$("finding").value=(S.iters.find(m=>m.iter==curIter)||{}).finding||"";render()}
+async function loadTrial(){curTrial=v("trial");if(curTrial==="")return;try{T=await (await fetch(`/api/trial?iter=${curIter}&trial=${curTrial}`)).json()}catch(e){T=null}renderTrial()}
+const FC={"選んだ":"#1a9e3a","隣の物に当たる":"#ff8c00","床に近すぎ":"#ffc800","IK: 掴む姿勢が取れない":"#0050ff","IK: 近づく姿勢が取れない":"#3d7bff",
+ "IK: 持ち上げる姿勢が取れない":"#7aa2ff","IK: 姿勢が大きく飛ぶ":"#a000ff","cuRobo: 本体・台に当たる":"#ff00c8"};
+function stepsHtml(T){const st=T.steps||{};const out=[];const st_ok=x=>x?'<b class="ok">✓</b>':'<b class="ng">✗</b>';
+ const pc=st.perceive;
+ const dc=st.decision;
+ if(dc){const KJ={aluminium:"アルミ",obstacle:"硬い物",soft:"柔らかい物"};
+  out.push(`<div class="step"><h3>0. 何から取るか（全部の物を見分ける → 画像言語モデルに相談 → 計画で確かめる）${dc.confident?'<b class="ok">自信あり</b>':'<b class="wn">要確認</b>'}</h3>
+  <div style="font-weight:600">${esc(dc.say||"")}</div>${(dc.why_low||[]).length?`<div class="wn">要確認の理由: ${dc.why_low.map(esc).join(" / ")}</div>`:""}
+  <div class="mut">モデル: ${dc.vlm_error?"使えなかった（"+esc(dc.vlm_error)+"）→ 決まった順で試した":esc(dc.vlm_scene||"")+(dc.vlm_seconds?` (${(+dc.vlm_seconds).toFixed(1)} s)`:"")}</div>
+  <table>${(dc.objects||[]).map(o=>`<tr><td>#${o.id}</td><td>${KJ[o.kind]||o.kind}</td><td class="mut">${esc(o.name)}</td><td class="mut">高さ ${(o.top*100).toFixed(0)} cm${o.kind=="aluminium"?" · アルミらしさ "+(+o.alu).toFixed(2)+" · 混み "+(+o.crowd).toFixed(2):""}</td></tr>`).join("")}</table>
+  <div class="kv">${(dc.tried||[]).map(t=>`#${t.id} ${t.action=="pick"?"取る":"どける"}（${t.from=="vlm"?"モデルの案":"規則"}: ${esc(t.why||"")}）→ ${t.ok?"掴み方あり":"だめ: "+esc(t.why_fail||"")}`).join("\n")}</div>
+  ${dc.img?`<div class="imgs"><a href="${dc.img}" target="_blank"><img src="${dc.img}?${Date.now()>>12}"></a></div><div class="mut">番号＝見分けた物 · 赤＝アルミ · 紫＝硬い物 · 灰＝柔らかい物 · 緑の縁＝選んだ物</div>`:""}</div>`)}
+ out.push(`<div class="step"><h3>1. 撮影（胸カメラ D435i・Thor）</h3><div class="kv">${esc(T.snap||"")}</div></div>`);
+ if(pc){const al=pc.cands.filter(c=>c.alu>=0.55);
+  out.push(`<div class="step"><h3>2. 識別（Grounding DINO が候補の箱 → SAM 2 が形を切る → 形と色の規則でアルミか点数）${st_ok(!!pc.chosen)}</h3>
+  <div>候補 ${pc.cands.length} 個 · アルミ ${al.length} 個 · 1 枚 ${pc.seconds!=null?(+pc.seconds).toFixed(2)+" s":"–"} · 深度 ${esc(pc.points_from||"")}</div>
+  <div class="kv">${pc.cands.slice(0,6).map(c=>`alu ${(+c.alu).toFixed(2)}${c.crowd!=null?" · 混み "+(+c.crowd).toFixed(2):""} · 細長さ ${(+c.aspect).toFixed(1)} · ${esc(c.label)}`).join("\n")}</div>
+  <div class="mut">赤＝狙う物 · 橙＝次に試すアルミ · 灰＝アルミでない · 紫＝隣の硬い物。混み＝爪が開く所が物でふさがっている割合（0.10 以下が楽）</div>
+  ${pc.img?`<div class="imgs"><a href="${pc.img}" target="_blank"><img src="${pc.img}?${Date.now()>>12}"></a></div>`:""}</div>`)}
+ for(const s of (st.plan_stats||[])){const tot=s.candidates||1;const fs=Object.entries(s.fates||{});
+  out.push(`<div class="step"><h3>3${(st.plan_stats||[]).length>1?"-"+(s.target+1):""}. 掴み方の候補（${esc((s.source||"").replace("graspgenx","GraspGenX").replace("bar","バー専用").replace("+"," ＋ "))}）→ 当たり・床・傾き → IK（腕の姿勢）→ cuRobo ${st_ok(!!s.chosen)}${s.target>0?" · 次のアルミで再挑戦":""}</h3>
+  <div>物の点 ${s.object_points} · 候補 ${s.candidates}${s.chosen?` → 選んだ: ${s.chosen.grasp_source=="graspgenx"?"GraspGenX の掴み方":s.chosen.grasp_source=="bar"?"バー専用の掴み方":esc(s.chosen.grasp_source||"")}・傾き ${(+s.chosen.tilt_deg).toFixed(0)}°・点数 ${(+s.chosen.score).toFixed(2)}`:" → 全部だめ"}</div>
+  ${Object.keys(s.by_source||{}).length>1?`<div class="kv">${Object.entries(s.by_source).map(([k,f])=>`${k=="graspgenx"?"GraspGenX":k=="bar"?"バー専用":k}: `+Object.entries(f).map(([a,b])=>`${a} ${b}`).join(" · ")).join("\n")}</div>`:""}
+  <div class="bar">${fs.map(([k,n])=>`<span title="${esc(k)} ${n}" style="width:${100*n/tot}%;background:${FC[k]||"#999"}"></span>`).join("")}</div>
+  <div class="kv">${fs.map(([k,n])=>`${esc(k)} ${n}`).join(" · ")}</div>
+  ${s.advice?`<div style="font-weight:600;margin:4px 0">→ ${esc(s.advice)}</div>`:""}
+  <div class="imgs">${[s.advice_img,s.img].filter(Boolean).map(u=>`<a href="${u}" target="_blank"><img src="${u}?${Date.now()>>12}"></a>`).join("")}</div></div>`)}
+ if(T.plan){out.push(`<div class="step"><h3>4. 空打ち（腕を動かさずに全部の区間を計算でなぞる：床・本体・クランプ）${st_ok(T.ready)}</h3>
+  <div class="kv">${(st.detours||[]).length?st.detours.map(esc).join("\n"):"cuRobo: 回り込み不要（まっすぐで当たらない）"}</div>
+  ${st.plan_img?`<div class="imgs"><a href="${st.plan_img}" target="_blank"><img src="${st.plan_img}?${Date.now()>>12}"></a></div>`:""}</div>`)}
+ if((st.phases||[]).length){out.push(`<div class="step"><h3>5. 実行（Thor → CAN → 腕）</h3><table>${st.phases.map(p=>`<tr><td>${esc(p.phase)}</td><td class="${p.err!=null&&p.err>10?"ng":"mut"}">${p.err!=null?"関節の遅れ "+p.err.toFixed(1)+"°":""}</td></tr>`).join("")}</table>
+  ${st.wrist?`<div class="imgs"><a href="${st.wrist}" target="_blank"><img src="${st.wrist}?${Date.now()>>12}"></a></div><div class="mut">閉じる直前の手首カメラ</div>`:""}</div>`)}
+ return `<details open><summary><b>処理の流れ（どこで何が起きたか）</b></summary><div class="steps">${out.join("")}</div></details>`}
+function renderTrial(){const b=$("trialbox"),job=S&&S.job,running=job&&job.ended==null;
+ if(!T||T.error){b.innerHTML='<div class="mut">試行はまだありません。物を置いたら「準備」。</div>';$("gobtn").disabled=true;$("gohint").textContent="";return}
+ const p=T.plan||{},st=T.stage=="executed"?(T.success?'<b class="ok">成功</b>':'<b class="ng">失敗</b>'):(T.ready?'<b class="ok">実行できる</b>':'<b class="ng">実行できない</b>');
+ b.innerHTML=`<div>${st} <span class="mut">${esc(T.name)} · ${esc(T.stage)} · ${esc(T.cause)}</span></div>
+ <div>${PR.map(k=>{const s=(T.predicates||{})[k]||"–";return `<span class="${s=="PASS"?"ok":s=="FAIL"?"ng":"mut"}">${k.replace(/_/g," ")}:${s=="PASS"?"✓":s=="FAIL"?"✗":"–"}</span>`}).join(" · ")}</div>
+ ${T.plan?`<div class="kv">score ${(+p.score).toFixed(2)} · rank ${p.rank} · 傾き ${(+p.tilt_deg).toFixed(1)}° · TCP→物体 ${(p.tcp_to_object_m*100).toFixed(1)} cm\nq_grasp ${(p.q_grasp_deg||[]).map(x=>(+x).toFixed(1)).join(", ")}</div>`:""}
+ ${T.gripper_at_hold!=null?`<div class="kv">保持中のグリッパー ${(+T.gripper_at_hold).toFixed(1)}° · ${T.completed?"最後まで動いた":"途中で止まった"}</div>`:""}
+ <div class="imgs">${T.imgs.map(u=>`<a href="${u}" target="_blank"><img src="${u}?${Date.now()>>12}" title="${esc(u.split("/").pop())}"></a>`).join("")}</div>
+ ${stepsHtml(T)}
+ <details><summary class="mut">空打ちと計画のログ</summary><div class="kv">${esc(T.snap)}\n\n${esc(T.dry_check)}\n\n${esc(T.plan_log)}</div></details>`;
+ const open=((S.iters.find(x=>x.iter==curIter)||{}).status=="running");
+ const can=T.ready&&T.stage=="prepared"&&!running&&open;$("gobtn").disabled=!can;
+ if(T.stage=="executed"){b.innerHTML+=`<div class="row" style="margin-top:6px"><span class="mut">目で見た結果（角度の判定は棒で外れることがある）:</span>
+  <button class="pri" onclick="observe(true)">持ち上がった</button><button onclick="observe(false)">持ち上がらなかった</button></div>`}
+ $("gohint").textContent=!open?"この回は締め済み":running?"ジョブの実行中":T.stage=="executed"?"この試行は実行済み。次は物を置き直して「準備」":!T.ready?"この試行は実行できない（"+(T.cause||"")+"）":"計画と画像を確かめてから押す"}
+function render(){const it=S.iters,names=it.map(m=>m.iter);
+ const sel=$("iter");if(sel.dataset.n!=names.join()){sel.innerHTML=names.slice().reverse().map(n=>{const m=it.find(x=>x.iter==n);return `<option value="${n}">${n} ${m.status=="running"?"●":""} ${esc((m.hypothesis||"").slice(0,50))}</option>`}).join("");sel.dataset.n=names.join()}
+ if(curIter=="__new__"&&S.job&&S.job.ended!=null&&S.job.iter)curIter=S.job.iter;
+ if(!curIter||!names.includes(curIter)){if(curIter!="__new__"){const r=it.filter(m=>m.status=="running");curIter=(r[r.length-1]||it[it.length-1]||{}).iter}}
+ if(curIter&&names.includes(curIter))sel.value=curIter;
+ const m=it.find(x=>x.iter==curIter)||{trials:[]};
+ $("iterinfo").innerHTML=m.iter?`${esc(m.status)} · ${esc(m.source)} · 成功 ${pct(m.success_rate)} (${m.n_trials??0}) · 判定の版 ${esc(m.verifier_version)}${m.decision?" · "+esc(m.decision):""}<br>${esc(m.hypothesis)}`:"回がありません";
+ const open=m.status=="running",busyJob=S.job&&S.job.ended==null;
+ if(m.iter&&!open)$("iterinfo").innerHTML+=`<br><b class="wn">締め済みの回です。試行を足すには ② で新しい回を開いてください。</b>`;
+ $("prepbtn").disabled=!open||busyJob;$("onebtn").disabled=!open||busyJob;$("batchbtn").disabled=!open||busyJob;
+ const ob=$("others");ob.style.display=S.others_active?"block":"none";
+ ob.textContent=S.others_active?`⚠ 別のセッションがループを動かしています（最新: ${S.others_active}）。同時に撮影・準備・実行しないでください。`:"";
+ const ts=$("trial"),tn=m.trials.map(t=>t.name);
+ if(ts.dataset.n!=curIter+tn.join()){ts.innerHTML=tn.slice().reverse().map(n=>`<option value="${parseInt(n)}">${esc(n)}</option>`).join("");ts.dataset.n=curIter+tn.join();
+  if(curTrial=="__new__"||curTrial==null||!tn.length)curTrial=tn.length?String(parseInt(tn[tn.length-1])):"";ts.value=curTrial;loadTrial()}
+ const j=S.job;$("jobstat").textContent=j?`${j.cmd}${j.iter?" · "+j.iter:""} · ${j.ended==null?"実行中…":"終了 (exit "+j.rc+")"} · ${j.started}`:"なし";
+ const lg=$("log"),atEnd=lg.scrollTop+lg.clientHeight>=lg.scrollHeight-10;lg.textContent=j?j.lines.join("\n"):"";if(atEnd)lg.scrollTop=lg.scrollHeight;
+ $("cancelbtn").disabled=!(j&&j.ended==null&&!["execute","batch"].includes(j.cmd));
+ if(S.latest_jpg)$("latest").innerHTML=`<a href="${S.latest_jpg}" target="_blank"><img src="${S.latest_jpg}"></a>`;
+ $("iters").innerHTML="<tr><th>回</th><th>仮説</th><th>成功</th><th>判定</th><th>所見</th></tr>"+it.slice(-12).reverse().map(m=>`<tr><td>${m.iter}</td><td>${esc((m.hypothesis||"").slice(0,120))}</td><td>${pct(m.success_rate)} (${m.n_trials??"…"})</td><td class="mut">${esc(m.status=="done"?m.decision:m.status)}</td><td class="mut">${esc((m.finding||"").slice(0,140))}</td></tr>`).join("");
+ $("ev").textContent=S.events.map(e=>`${e.t} ${e.kind} ${Object.entries(e).filter(([k])=>!["t","kind","params","args"].includes(k)).map(([k,x])=>k+"="+(typeof x=="object"?JSON.stringify(x):x)).join(" ")}`).join("\n");
+ renderTrial()}
+let lastEnded=null;
+async function tick(){try{S=await (await fetch("/api/state")).json();fill(S.defaults);
+ if(S.job&&S.job.ended!=lastEnded){lastEnded=S.job.ended;if(curTrial&&curTrial!="__new__")loadTrial()}render();
+ if(askAfterPrep&&S.job&&S.job.cmd=="prepare"&&S.job.ended!=null){if(S.job.rc==0)afterPrep();else{askAfterPrep=false;toast("準備が失敗しました（ログを見てください）")}}}catch(e){$("jobstat").textContent="パネルのサーバーに届かない"}}
+tick();setInterval(tick,1500);checkHealth();
+</script></body></html>

@@ -1,0 +1,47 @@
+{
+ "T_base_cam": [
+  [
+   0.020939554015646986,
+   0.9314320754365006,
+   0.3633122953131077,
+   0.05485277501491167
+  ],
+  [
+   0.9993345326709369,
+   -0.008643600411457921,
+   -0.0354369860920363,
+   -0.033709321306098994
+  ],
+  [
+   -0.029866819197663652,
+   0.36381255753475583,
+   -0.9309932309587615,
+   0.8485638630005964
+  ],
+  [
+   0.0,
+   0.0,
+   0.0,
+   1.0
+  ]
+ ],
+ "markers_link7_m": [
+  [
+   0.0021464110322369436,
+   0.06519709608303527,
+   0.15935691293845528
+  ],
+  [
+   0.07852500908423526,
+   -0.0033200357375192404,
+   0.0961818543930311
+  ]
+ ],
+ "n": 6,
+ "median_m": 0.002113802753869986,
+ "p90_m": 0.005706760936189474,
+ "max_m": 0.0069884479477233434,
+ "method": "fit_handeye_markers.py on hn_211315: two id0 markers (offsets fixed from T_base_cam.guess-kitakyushu-mount.json), per-detection marker assignment, soft_l1, left-arm correction in the FK, + floor constraint (config/floor_plane.json)",
+ "created": "2026-11-22 21:2x",
+ "note": "Chest D435i 344422070898 on the Kitakyushu mount (Sota, 2026-11-22 night): 0.58 m above the floor, ~69 deg down, image top = robot side. handeye_near_20261122_211315 (the 52-pose left-arm sweep of 16:24): 6 id0 detections, FK with the left-arm correction (left_arm_corr.json), + floor constraint. Checked by drawing the arm model on 4 sample frames (grasp/runs/ltcp/hn_211315). Previous: T_base_cam.bak-20261122-before-kitakyushu-mount.json"
+}

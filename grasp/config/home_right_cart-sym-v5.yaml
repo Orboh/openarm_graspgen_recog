@@ -1,0 +1,13 @@
+# right arm home (lerobot deg). 2026-11-22 Sota: 「グリッパーの初期姿勢の位置を 15 cm 後ろへ」 — the jaws were in the chest
+# camera's view after it was aimed straight down. v4 (home_right_cart-sym-v4.yaml) with the TCP moved 15 cm back (-x), orientation
+# within ~12 deg, checked with grasp/arm_collision.py (body, camera, clamp, other arm >= 2 cm).
+align:
+  max_speed_dps: 15.0
+joint_1: -80.0
+joint_2: 1.0
+joint_3: 4.9
+joint_4: 103.2
+joint_5: 4.2
+joint_6: 4.8
+joint_7: 76.0
+gripper: 0.0
