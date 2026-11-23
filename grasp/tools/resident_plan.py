@@ -165,6 +165,9 @@ def main() -> int:
     ap.add_argument("--place-on-surface", default=None,
                     help="置き場の物の名前（例 blue_scale）。その色の上面を見つけ、縁から 4 cm 内側を拾う物に近い順に置き先として試す"
                          "（置く高さは上面に合わせる・2026-11-23）")
+    ap.add_argument("--place-by-material", action="store_true",
+                    help="置き先を、thor_snap.py --yoloe が <回>/pick.json に書いた材質から plan_place.py --by-material で決める"
+                         "（grasp/classification.py の ROUTE_OFFSET・--snap-args に --yoloe が要る・2026-11-23 Shreyan）")
     ap.add_argument("--place-args", default="", help="--place-on・--place-to のとき plan_place.py に足す引数")
     ap.add_argument("--retry-plan-args", default="--rounds 3",
                     help="計画が立たなかったとき、GraspGenX を出し直して 1 度だけ計画し直す。そのとき --plan-args の後ろに足す引数"
@@ -173,6 +176,8 @@ def main() -> int:
                     help="ZMQ の口（例 tcp://*:5560）で「撮る」と「計画する」を別々に受ける（grasp/tools/grasp_daemon.py が使う・2026-11-23）。"
                          "撮った直後に腕を上げ始め、その間に計画するため")
     a = ap.parse_args()
+    if a.place_by_material and "--yoloe" not in a.snap_args.split():
+        ap.error("--place-by-material には --snap-args の --yoloe が要る（材質は pick.json から読む）")
     if not a.serve and not a.q:
         ap.error("--q が要る（--serve のときだけ省ける）")
 
@@ -262,6 +267,10 @@ def main() -> int:
             t = time.time()
             place = shift_step(name)
             tt["置き先"] = time.time() - t
+        elif a.place_by_material and planned:
+            t = time.time()
+            place = material_step(name)
+            tt["置き先"] = time.time() - t
         total = time.time() - t0
         print(f"[resident] #{k} {name}: " + "・".join(f"{kk} {v:.2f}" for kk, v in tt.items())
               + f" 秒 → 合計 {total:.2f} 秒（GraspGenX {len(inf)} 回）| {chosen[-1] if chosen else out.strip()[-200:]}", flush=True)
@@ -307,6 +316,20 @@ def main() -> int:
             res["summary"] = (f"{a.place_on_surface} の上面 z {np.median(P[:, 2]):.3f}・候補 {len(spots)} 個 → "
                               + (f"({res['at'][0]:.3f},{res['at'][1]:.3f}) に置く（{len(tried)} 個目）" if res["ok"]
                                  else f"{len(tried)} 個とも解けない: " + " / ".join(tried[:3])))
+        with open(os.path.join(d, "place_target.json"), "w") as f:
+            json.dump(res, f, ensure_ascii=False, indent=2)
+        return res
+
+    def material_step(name):
+        """--place-by-material: pick.json の材質から plan_place.py --by-material で置き先を解く。結果は <回>/place_target.json。"""
+        from grasp.tools import plan_place
+        d = os.path.join(RUNS, name)
+        rc, out = call_main(plan_place, [d, "--by-material", *a.place_args.split()])
+        line = [l.strip() for l in out.splitlines() if l.startswith("[place]")]
+        mat = None
+        if os.path.exists(os.path.join(d, "pick.json")):
+            mat = json.load(open(os.path.join(d, "pick.json")))["chosen"].get("material")
+        res = {"ok": rc == 0, "material": mat, "summary": " / ".join(line[-2:]) if line else out.strip()[-200:]}
         with open(os.path.join(d, "place_target.json"), "w") as f:
             json.dump(res, f, ensure_ascii=False, indent=2)
         return res

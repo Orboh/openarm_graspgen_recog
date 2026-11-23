@@ -195,12 +195,26 @@ def perceive_target(a, img, depth, K, tbc, d):
                                     f" (others: {[f[4] for f in found[1:]]})")
 
 
+def clean_points(pts: np.ndarray, p: SegParams = SegParams()) -> np.ndarray:
+    """mask から出した点（カメラの座標）を、segment_clusters と同じ手順で整える（2026-11-23 Shreyan）。
+    mask の縁の深度の飛び（背景と混ざった画素）が残ると、外形が 10 cm 以上ふくらみ、GraspGenX の候補が爪の隙間・床の確かめで全部落ちた。"""
+    import open3d as o3d
+    pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts.astype(np.float64))).voxel_down_sample(p.voxel)
+    if len(pc.points) < p.dbscan_min_pts:
+        return np.asarray(pc.points, dtype=np.float32)
+    lab = np.asarray(pc.cluster_dbscan(p.dbscan_eps, p.dbscan_min_pts))
+    if lab.max() >= 0:
+        pc = pc.select_by_index(np.where(lab == np.argmax(np.bincount(lab[lab >= 0])))[0])
+    pc, _ = pc.remove_statistical_outlier(p.sor_nb, p.sor_std)
+    return np.asarray(pc.points, dtype=np.float32)
+
+
 def pick_target(a, img, depth, K, tbc, d):
     """Generalized heap sorter (2026-11-23): YOLOE-26 prompt-free gives every object's mask in one shot (no text
     prompts to tune, unlike --perceive's Grounding DINO), and each is back-projected to 3D the same way --perceive
     does it: real depth where there is enough of it, floor-plane + assumed height where the top is shiny/missing.
     Rule (pure geometry, no material involved): an object isolated from the rest of the heap beats picking off the
-    top of the heap; among isolated candidates the one nearest the robot (base-frame origin) goes first; among
+    top of the heap; among isolated candidates the one FARTHEST from the robot (base-frame origin) goes first; among
     non-isolated ones, whichever sits highest above the floor goes first (same "clear ones, then highest" idea as
     --perceive, just not hardcoded to bar shapes). Material plays no part in picking the target.
     Material (grasp.classification.classify_material, SigLIP zero-shot) is found only AFTER the target is decided --
@@ -227,23 +241,53 @@ def pick_target(a, img, depth, K, tbc, d):
     v, u = np.mgrid[0:depth.shape[0], 0:depth.shape[1]]
     P_all = np.stack([(u - K[0, 2]) * depth / K[0, 0], (v - K[1, 2]) * depth / K[1, 1], depth], -1)
 
+    full = [cv2.resize(m.astype(np.uint8), (depth.shape[1], depth.shape[0]), interpolation=cv2.INTER_NEAREST).astype(bool)
+            if m.shape != depth.shape else m for m in masks]
+    # 2 つ以上の mask が取り合う画素は、いちばん小さい mask のものにする（物はマット・台の上に載っている。2026-11-23: 前は
+    # 「どちらにも入れない」にしていて、マットの mask に丸ごと覆われた木の丸太が消えた）
+    owner = np.full(depth.shape, -1, int)
+    for i in sorted(range(len(full)), key=lambda i: full[i].sum(), reverse=True):
+        owner[full[i]] = i
     cands = []
-    for i, m in enumerate(masks):
+    n_plane = 0
+    n_border = 0
+    for i, m in enumerate(full):
         if m.shape != depth.shape:
             m = cv2.resize(m.astype(np.uint8), (depth.shape[1], depth.shape[0]), interpolation=cv2.INTER_NEAREST).astype(bool)
         m = cv2.erode(m.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+        m &= owner == i
+        # 画面の縁に掛かる物（外から来るケーブル・画面の外へはみ出した物）は全体が見えないので選ばない（2026-11-23: 腕のケーブルを選んだ）
+        b, fm = a.border_px, full[i]  # 縮める前の mask で見る
+        if b > 0 and (fm[:b].any() or fm[-b:].any() or fm[:, :b].any() or fm[:, -b:].any()):
+            n_border += 1
+            continue
+        # いちばん大きいつながった領域だけを残す（2026-11-23: バーの mask に重量計の縁の細い切れ端が付き、縁と縁の距離が 0 になった）
+        nl, lab, stats, _ = cv2.connectedComponentsWithStats(m.astype(np.uint8), connectivity=8)
+        if nl > 2:
+            m = lab == (1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA])))
         if m.sum() < 60:
             continue
         z = depth[m]; uu, vv = u[m], v[m]
         P = P_all[m]
         h = P @ n + dd
-        ok = (z > 0) & (h > 0.005) & (h < a.hmax)
+        valid = z > 0
+        # 2026-11-23 Shreyan: RANSAC の床（floor_plane_base）を、対象を選ぶ前の絞り込みにも使う。深度のある画素の大半が床の面の上
+        # （|高さ| < --plane-dist）なら、床・マット・床の模様なので候補にしない。前は深度があっても上に点が足りないと下の
+        # 「光って深度が無い」扱いに落ち、床から 2 cm 浮いた物として候補に戻っていた
+        if valid.sum() >= 0.5 * m.sum() and np.mean(np.abs(h[valid]) < a.plane_dist) > a.plane_frac:
+            n_plane += 1
+            continue
+        ok = valid & (h > a.plane_dist) & (h < a.hmax)
         if ok.sum() >= max(60, 0.25 * m.sum()):
             pts, src = P[ok], "depth"
+        elif valid.sum() >= 0.5 * m.sum():  # 深度はあるのに、床の上の高さの範囲に点が足りない（--hmax より高い物・腕など）
+            continue
         else:  # shiny/no-depth top: rays through the mask pixels onto the floor plane raised by the assumed height
             ray = np.stack([(uu - K[0, 2]) / K[0, 0], (vv - K[1, 2]) / K[1, 1], np.ones(len(uu))], 1)
             t = (a.obj_height - dd) / (ray @ n)
             pts = ray * t[:, None]; pts, src = pts[t > 0], "plane+height"
+        if src == "depth":
+            pts = clean_points(pts)  # 旧い切り出し（segment_clusters）と同じ後始末: 4 mm の格子・DBSCAN のいちばん大きいかたまり・外れ値
         if len(pts) < 40:
             continue
         pb = pts @ T[:3, :3].T + T[:3, 3]
@@ -252,27 +296,76 @@ def pick_target(a, img, depth, K, tbc, d):
                      "top": float(np.percentile(pts @ n + dd, 90)),
                      "centroid": centroid, "radius": float(np.percentile(np.linalg.norm(pb[:, :2] - centroid, axis=1), 90)),
                      "material": None, "mat_conf": None, "det_conf": float(confs[i])})
+    if n_border:
+        print(f"[snap] yoloe: 画面の縁に掛かるので外した mask {n_border} 個", flush=True)
+    if n_plane:
+        print(f"[snap] yoloe: 床の面（RANSAC）の上の平らな領域として外した mask {n_plane} 個", flush=True)
+    # 2026-11-23 Shreyan: 旧い切り出しと同じく、腕の届く範囲（--band）の外と、ロボット自身の腕・爪（--self-q）を候補から外す。
+    # 外さないと、胸のカメラに写った自分のグリッパー（机から 13 cm）が「積みのいちばん上」として選ばれた
+    if cands and a.band != "none":
+        x0, x1, y0, y1 = map(float, a.band.split(","))
+        cands = [c for c in cands if x0 < c["centroid"][0] < x1 and y0 < c["centroid"][1] < y1]
+    if cands and a.exclude_xy:  # 2026-11-23 Shreyan: この回までに置いた所（run_pipeline.sh --n）。置いた物を拾い直さない
+        done_xy = np.array([[float(v) for v in xy.split(",")] for xy in a.exclude_xy.split(";") if xy.strip()])
+        before = len(cands)
+        cands = [c for c in cands if np.min(np.linalg.norm(done_xy - c["centroid"], axis=1)) > a.exclude_r]
+        if len(cands) < before:
+            print(f"[snap] yoloe: 置いた所にある候補 {before - len(cands)} 個を外した", flush=True)
+    segs = getattr(a, "_self_segs", None)
+    if cands and segs:
+        r = a.self_drop if a.self_drop > 0 else a.self_r
+        keep = []
+        for c in cands:
+            dmin = np.full(len(c["pb"]), np.inf)
+            for p0, p1 in segs:
+                sg = p1 - p0; t = np.clip(((c["pb"] - p0) @ sg) / max(sg @ sg, 1e-9), 0, 1)
+                dmin = np.minimum(dmin, np.linalg.norm(c["pb"] - (p0 + t[:, None] * sg), axis=1))
+            if np.mean(dmin <= r) <= 0.5:
+                keep.append(c)
+        if len(keep) < len(cands):
+            print(f"[snap] yoloe: 腕・爪として外した候補 {len(cands) - len(keep)} 個", flush=True)
+        cands = keep
     if not cands:
-        raise RuntimeError("no candidates survived depth/height filtering")
+        raise RuntimeError("no candidates survived depth/height/band/self filtering")
 
+    # 2026-11-23 Shreyan: 孤立の度合いは、中心と半径ではなく、切り出した物どうしの縁と縁の距離で測る（机に沿った XY の最短距離）。
+    # 中心と半径では、大きい物（重量計・長いバー）の半径がほかの物まで届き、どれも孤立と見なされなかった
+    from scipy.spatial import cKDTree
+    rng = np.random.default_rng(0)
     for c in cands:
-        gaps = [np.linalg.norm(c["centroid"] - o["centroid"]) - c["radius"] - o["radius"] for o in cands if o is not c]
+        xy = c["pb"][:, :2]
+        c["_xy"] = xy[rng.choice(len(xy), 3000, replace=False)] if len(xy) > 3000 else xy
+        c["_tree"] = cKDTree(c["_xy"])
+    for c in cands:
+        gaps = [float(o["_tree"].query(c["_xy"], k=1)[0].min()) for o in cands if o is not c]
         c["isolation_gap"] = min(gaps) if gaps else float("inf")
         c["isolated"] = c["isolation_gap"] > a.isolation_gap
+        # ロボットからの距離 = ハンドアイ（T_base_cam）で出した腕の付け根の座標（openarm_body_link0）の原点から、物の中心までの水平距離
         c["dist_robot"] = float(np.linalg.norm(c["centroid"]))
-    # isolated-from-the-heap beats the heap; among isolated ones, nearest the robot first; otherwise highest first
-    cands.sort(key=lambda c: (not c["isolated"], c["dist_robot"] if c["isolated"] else -c["top"]))
+    for c in cands:
+        del c["_xy"], c["_tree"]
+    # 孤立した物が先。孤立した物の中では、ロボットからいちばん遠い物が先。孤立した物が無ければ、積みのいちばん上（床から高い物）が先
+    cands.sort(key=lambda c: (not c["isolated"], -c["dist_robot"] if c["isolated"] else -c["top"]))
     best = cands[0]  # target is decided by geometry alone -- material has no vote
 
     # NOW classify, once, only the winner -- the losers' material is never needed, so it's never computed
     ys, xs = np.where(best["mask"])
-    best["material"], best["mat_conf"] = classify_material(img[ys.min():ys.max() + 1, xs.min():xs.max() + 1])
+    # 2026-11-23 Shreyan: 箱で切り抜くと、斜めの細い物（バー）では箱の大半が背景（マット）になり材質を取り違えた。mask の外は灰色で塗る
+    pad = 4
+    y0, y1 = max(0, ys.min() - pad), min(img.shape[0], ys.max() + 1 + pad)
+    x0, x1 = max(0, xs.min() - pad), min(img.shape[1], xs.max() + 1 + pad)
+    crop = img[y0:y1, x0:x1].copy()
+    crop[~best["mask"][y0:y1, x0:x1]] = 128
+    cv2.imwrite(os.path.join(d, "material_crop.png"), crop)
+    best["material"], best["mat_conf"] = classify_material(crop)
     best["mat_conf"] = float(best["mat_conf"])
 
     cv2.imwrite(os.path.join(d, "mask.png"), (best["mask"].astype(np.uint8) * 255))
+    np.savez_compressed(os.path.join(d, "cand_masks.npz"), masks=np.stack([c["mask"] for c in cands]))  # 候補の順（pick.json の cands と同じ）
     summary = [{k: v for k, v in c.items() if k not in ("mask", "pts", "pb")} for c in cands]
     json.dump({"cands": summary, "chosen": {k: v for k, v in best.items() if k not in ("mask", "pts", "pb")}},
-              open(os.path.join(d, "pick.json"), "w"), indent=1)
+              open(os.path.join(d, "pick.json"), "w"), indent=1,
+              default=lambda o: o.tolist() if isinstance(o, np.ndarray) else (o.item() if isinstance(o, np.generic) else str(o)))
     for f in glob.glob(os.path.join(d, "object_alt_*.npy")):
         os.remove(f)
     for i, c in enumerate([c for c in cands if c is not best][:4]):
@@ -332,7 +425,14 @@ def main(argv=None) -> int:
                     "Grounding DINO aluminium-only pipeline; the winner is then labelled by material "
                     "(grasp/classification.py, SigLIP) for routing to a bin")
     ap.add_argument("--isolation-gap", type=float, default=0.03, help="--yoloe: min gap [m] to the nearest other candidate's "
-                    "footprint to count as isolated from the heap")
+                    "footprint (edge to edge, base-frame XY) to count as isolated from the heap")
+    ap.add_argument("--exclude-xy", default="", help="--yoloe: 腕の付け根の座標 x,y を ; で並べる。中心がここから --exclude-r 以内の候補を外す（置いた物）")
+    ap.add_argument("--border-px", type=int, default=8, help="--yoloe: 画面の縁からこの画素以内に掛かる mask は選ばない（0 で使わない）")
+    ap.add_argument("--exclude-r", type=float, default=0.07, help="--exclude-xy の半径 [m]")
+    ap.add_argument("--plane-dist", type=float, default=0.008,
+                    help="--yoloe: RANSAC の床の面からこの距離 [m] 以内の点を床とみなす（segment.py の plane_dist と同じ）")
+    ap.add_argument("--plane-frac", type=float, default=0.6,
+                    help="--yoloe: 深度のある画素のうち床の面の上の割合がこれより多い mask は、床・マットとして対象を選ぶ前に外す")
     ap.add_argument("--obj-height", type=float, default=0.02, help="--yoloe: assumed object height [m] when its depth is missing")
     a = ap.parse_args(argv)
     if a.list_targets:
@@ -404,6 +504,7 @@ def main(argv=None) -> int:
         pts = pts[inb | floor_like]
     msg = ""
     if a.yoloe:
+        a._self_segs = segs  # pick_target で腕の線から近い候補を外す
         try:
             obj, msg = pick_target(a, img, depth, K, tbc, d)
             np.save(os.path.join(d, "object.npy"), obj)

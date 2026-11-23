@@ -84,13 +84,25 @@ def segment_largest_object(pts: np.ndarray, p: SegParams = SegParams(), return_d
     return (clusters[0], dbg) if return_debug else clusters[0]
 
 
+_YOLOE = None
+
+
+def _yoloe():
+    """YOLOE-26 を 1 度だけ読み込む（常駐の resident_plan.py で毎回読み直さない）。重みは GRASP_YOLOE_WEIGHTS で差し替える。"""
+    global _YOLOE
+    if _YOLOE is None:
+        from ultralytics import YOLOE
+        _YOLOE = YOLOE(os.environ.get("GRASP_YOLOE_WEIGHTS", "yoloe-26l-seg-pf.pt"))
+    return _YOLOE
+
+
 def segment_object_frames(cap_dir: str, p: SegParams = SegParams(), return_debug: bool = False):
     """cap_dir's color.png → YOLOE-26 prompt-free instance masks (list[ultralytics.engine.results.Results]).
     Used by thor_snap.py's --yoloe / pick_target, which classifies only the winning mask's material afterward."""
-    from ultralytics import YOLOE
-    model = YOLOE("yoloe-26l-seg-pf.pt")
     color_path = os.path.join(cap_dir, "color.png")
-    segmented_objects = model.predict(source=color_path, save=True, save_txt=True, conf=0.25, device="cuda", project=cap_dir, name="segmentation")
+    device = os.environ.get("GRASP_RECOG_DEVICE", "cuda")
+    segmented_objects = _yoloe().predict(source=color_path, save=True, save_txt=True, conf=0.25, device=device,
+                                         project=cap_dir, name="segmentation", exist_ok=True, verbose=False)
     r = segmented_objects[0]
     print(f"masks found: {0 if r.masks is None else len(r.masks.data)}")
     return segmented_objects
