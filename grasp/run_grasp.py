@@ -34,6 +34,44 @@ G_OPEN = float(os.environ.get("GRASP_GRIPPER_OPEN", "-60.0")); G_CLOSE = float(o
 FLOOR_Z = float(os.environ.get("GRASP_FLOOR_Z", "0.27"))                # floor height in the base frame (from the T_base_cam fit)
 if os.environ.get("GRASP_SITE") and "GRASP_FLOOR_Z" not in os.environ:  # 東京の台車以外で床の高さを決め忘れたら動かさない
     sys.exit("[grasp] GRASP_FLOOR_Z が無い（GRASP_SITE=" + os.environ["GRASP_SITE"] + "）。東京の台車の値のまま床の確認をしない。grasp/config/sites/ で決める")
+def _load_timing():
+    """grasp/timing.py をファイルの場所から読む（段ごとの時間・記録だけ・2026-11-25 Shreyan）。sys.path も import の順も変えない。
+    読めなければ何もしない代わりの物を返す。"""
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("grasp_timing_run", os.path.join(os.path.dirname(os.path.abspath(__file__)), "timing.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:  # noqa: BLE001
+        class _Off:
+            def event(self, *a, **k): pass
+            def startup(self): pass
+        return _Off()
+
+
+_TIMING = _load_timing()
+
+
+def _timed(fn, stage, label_arg=None):
+    """fn をそのまま呼び、かかった時間だけを残す（引数・返り値・例外は何も変えない）。label_arg は区間名の引数の位置。"""
+    def wrapper(*args, **kw):
+        t0 = time.time()
+        ok = True
+        try:
+            return fn(*args, **kw)
+        except BaseException:
+            ok = False
+            raise
+        finally:
+            label = args[label_arg] if label_arg is not None and len(args) > label_arg else None
+            _TIMING.event(stage, t0, time.time(), name=label, **({} if ok else {"ok": False}))
+    return wrapper
+
+
+HOVER_TCP_MIN = 0.07  # --hover: 爪の中心が机からこれより上なら「上げた姿勢」とみなす [m]（休みの姿勢は約 3 cm・上げると約 11 cm）
+
+
 class MotorLost(SystemExit):
     """モーターの返事が途切れた（非常停止・電源断）。これ以上は腕に指令を送らず、記録も先へ進めない。"""
 
@@ -106,6 +144,21 @@ def main(argv=None, *, robot=None, plan_wait=None, t_trigger=None) -> int:
                     help="置き先へ下ろす・置いた所から上がる・元の場所に下ろす速さ [deg/s]（無ければ --near-dps）")
     ap.add_argument("--close-wait", type=float, default=0.5, help="爪を閉じてから持ち上げるまで待つ秒数")
     ap.add_argument("--fix-s", type=float, default=0.6, help="位置の補正（足りない分の送り直し）1 回の長さ [s]")
+    ap.add_argument("--transit-tol", type=float, default=1.0,
+                    help="移動の区間（--transit-dps 以上の速さの動き）で、位置の補正を始める関節の誤差 [deg]。物の近くの動きは 1° のまま。"
+                         "既定 1.0 は今までどおり（2026-11-25 Shreyan・速くする: 移動の区間の終わりに毎回 0.7 秒の補正が入っていた）")
+    ap.add_argument("--hover", action="store_true",
+                    help="回の終わりに休みの姿勢へ下ろさず、上げた姿勢（raise）で止まる。上げた姿勢から始めた回は、もう上げずにその姿勢を raise にする"
+                         "（2026-11-25 Shreyan・速くする: 1 つ置くたびに下ろして次の回にまた上げていた。--keep-torque と常駐の腕のプロセスで使う）")
+    ap.add_argument("--keep-torque", action="store_true",
+                    help="終わりにモーターを切らない（渡されたロボットだけ・grasp/tools/arm_server.py が回の間も腕を支える）")
+    ap.add_argument("--approach-fallback", action="store_true",
+                    help="cuRobo の plan_grasp で近づく軌道を作れなければ、前の動き（--legacy-approach と同じ・区間ごとに床・keep-out・cuRobo で"
+                         "確かめ、当たれば回り込むか止まる）で近づく（2026-11-25 Shreyan: 左腕の plan_grasp が 13 回中 10 回、真下へ差し込む段で作れず、"
+                         "右腕は前の動きで今日の物を全部置けた）")
+    ap.add_argument("--open-during-approach", action="store_true",
+                    help="爪を開くのを raise で止まって待たず、raise → pregrasp の動きの間に開く（2026-11-25 Shreyan・速くする: 開くだけで約 2.6 秒）。"
+                         "cuRobo の近づく軌道は爪を開いた形で当たりを見ているので、開きかけの爪はその内側に収まる")
     ap.add_argument("--near-dps", type=float, default=6.0, help="joint speed near the object/floor: approach, close, put down, release [deg/s]")
     ap.add_argument("--hold-home", action="store_true",
                     help="end every trial at --home and keep torque ON (disconnect without disabling torque); "
@@ -155,6 +208,12 @@ def main(argv=None, *, robot=None, plan_wait=None, t_trigger=None) -> int:
     ap.add_argument("--start", default=None, help="start pose (lerobot deg, comma-separated). Default = read from the robot (only with --go)")
     ap.add_argument("--home-right", default=None, help="右腕のときの --home（左の初期姿勢を右腕に使わない）。無ければ GRASP_HOME_RIGHT")
     a = ap.parse_args(argv)
+    _TIMING.startup()
+    if a.keep_torque and robot is None:
+        sys.exit("[run] --keep-torque は常駐の腕のプロセス（grasp/tools/arm_server.py）が渡したロボットとだけ使う"
+                 "（このプロセスで接続すると、終わりに接続を切るときに腕が落ちる）")
+    if a.hover and (a.early or a.home):
+        sys.exit("[run] --hover は --early・--home と一緒に使えない")
     if a.early:
         if not a.go:
             sys.exit("[run] --early は --go と一緒にだけ使う（乾式の確かめは計画ができてから --early なしで打つ）")
@@ -192,8 +251,10 @@ def main(argv=None, *, robot=None, plan_wait=None, t_trigger=None) -> int:
     # IK はこの repo の物を先に読む（右腕の OpenArmIK があるのはこちら。OPENARM_REPO の古い写しには無い）
     sys.path.insert(0, REPO)
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    _t = time.time()
     from ik.openarm_left_ik import OpenArmIK
     ik = OpenArmIK(URDF, side=side)
+    _TIMING.event("run/build pinocchio IK", _t, time.time())
 
     def tcp_z(qd):
         M = ik.fk(np.deg2rad(qd)); return float((M.translation + M.rotation @ [0, 0, 0.2145])[2])
@@ -228,6 +289,8 @@ def main(argv=None, *, robot=None, plan_wait=None, t_trigger=None) -> int:
                 raise Blocked(f"[run] cuRobo: {CUROBO.describe(bad)}。腕が置き場の周りの物（本体・カメラ・机）に当たる。Stopping")
         if not quiet:
             print(f"[run] check ok: {name}")
+
+    check = _timed(check, "run/check segment", 2)
 
     def load_obstacles(q_now):
         """記録のカメラの障害物（plan.py が残した点）を、今の腕の角度 q_now で腕の点を消し直してサーバーに入れる。
@@ -343,6 +406,9 @@ def main(argv=None, *, robot=None, plan_wait=None, t_trigger=None) -> int:
                 prev = v
             return [list(v) for v in vias]
 
+    route = _timed(route, "run/route (check or detour)", 2)
+    load_obstacles = _timed(load_obstacles, "run/load obstacles to cuRobo")
+
     pre = grasp = lift = carry = place = None  # 計画の姿勢（load_plan が入れる。--early では計画ができてから）
     import pinocchio as pin
 
@@ -368,8 +434,27 @@ def main(argv=None, *, robot=None, plan_wait=None, t_trigger=None) -> int:
 
     def raised(qd, dz=0.08):
         """Pose with the TCP raised dz straight up while keeping its orientation (lift off the floor first when leaving the resting pose)."""
-        M = ik.fk(np.deg2rad(qd)); T = pin.SE3(M.rotation, M.translation + np.array([0, 0, dz]))
-        q, ok, _, _ = ik.solve(T, np.deg2rad(qd), position_only=False, max_iter=300)
+        # 可動域の中に寄せた姿勢から上げる（2026-11-25 Shreyan: 脱力した左腕の J5 が -91.6°（下限 -90°）まで垂れて、同じ手先の向きのままでは
+        # 可動域の中の解が無く「上げられない」で止まった。可動域の中なら何も変わらない。今の姿勢から上げた姿勢への区間は route で確かめる）
+        q_in = ik.clamp(np.deg2rad(qd))
+        M = ik.fk(q_in); T = pin.SE3(M.rotation, M.translation + np.array([0, 0, dz]))
+        q, ok, _, _ = ik.solve(T, q_in, position_only=False, max_iter=300)
+        if (not ok or not ik.within_limits(q)) and CUROBO is not None and hasattr(CUROBO, "ik"):
+            # Pinocchio の IK は可動域を守らずに外へ出ることがある。cuRobo の IK（可動域を守る）で、可動域の中に寄せた姿勢に近い解を探す
+            T4 = np.eye(4); T4[:3, :3] = T.rotation; T4[:3, 3] = T.translation
+            try:
+                Q, OK = CUROBO.ik(T4[None], seed_deg=np.rad2deg(q_in)[None], return_seeds=8)
+                best = None
+                for qd2, ok2 in zip(Q[0], OK[0]):
+                    r = np.deg2rad(qd2)
+                    if ok2 and ik.within_limits(r):
+                        dmax = float(np.max(np.abs(qd2 - np.rad2deg(q_in))))
+                        if dmax <= 40.0 and (best is None or dmax < best[0]):
+                            best = (dmax, r)
+                if best is not None:
+                    q, ok = best[1], True
+            except Exception:  # noqa: BLE001  IK を持たないサーバー（--no-ik）: 今までどおり止まる
+                pass
         if not ok or not ik.within_limits(q):
             raise SystemExit("[run] can't solve the lift from the start pose. Stopping")
         return list(np.rad2deg(q))
@@ -424,6 +509,11 @@ def main(argv=None, *, robot=None, plan_wait=None, t_trigger=None) -> int:
         nonlocal pre, grasp, lift, carry, place
         pre, grasp, lift = p["q_pre_deg"], p["q_grasp_deg"], p["q_lift_deg"]
         carry, place = p.get("q_carry_deg"), p.get("q_place_deg")
+        # 計画が手前・持ち上げを短くした（plan.py --short-fallback）なら、cuRobo の plan_grasp もその距離で作る（2026-11-25 Shreyan）
+        if p.get("pregrasp_m"):
+            a.pregrasp_m = float(p["pregrasp_m"])
+        if p.get("lift_m"):
+            a.lift_m = float(p["lift_m"])
         setup_servo()
 
     if not a.early:
@@ -450,6 +540,7 @@ def main(argv=None, *, robot=None, plan_wait=None, t_trigger=None) -> int:
         print(f"[run] check ok: {name}（cuRobo の細かい軌道 {len(path)} 点・端から端の関節 最大 {span:.0f}°・"
               f"隣の点の差 最大 {step:.1f}°）", flush=True)
 
+    check_dense = _timed(check_dense, "run/check dense path", 1)
     use_gp = CUROBO is not None and not a.legacy_approach
 
     def grasp_plan(q_up):
@@ -461,7 +552,10 @@ def main(argv=None, *, robot=None, plan_wait=None, t_trigger=None) -> int:
         pads = [a.plan_target_pad] + [p for p in (0.02, a.target_pad) if p < a.plan_target_pad] if a.avoid_target else [None]
         for k, pad in enumerate(pads):
             tb = target_box(pad, quiet=True) if pad is not None else None
+            _t = time.time()
             r = CUROBO.plan_grasp(q_up, fk44(grasp), approach=a.pregrasp_m, lift=0.0 if a.wrist_servo else a.lift_m, target=tb)
+            _TIMING.event("run/plan_grasp attempt", _t, time.time(), pad=pad, status=r.get("status"),
+                          ok=bool(r["success"] and all(r[n] is not None for n in need)))
             if r["success"] and all(r[n] is not None for n in need):
                 if pad is not None:
                     print(f"[run] plan_grasp: 拾う物の箱の余白 {pad * 100:.0f} cm で計画した"
@@ -498,6 +592,45 @@ def main(argv=None, *, robot=None, plan_wait=None, t_trigger=None) -> int:
         return {"up_pre": Dense(A), "pre_up": Dense(A[::-1]), "pre_grasp": Dense(G), "grasp_pre": Dense(G[::-1]),
                 "grasp_lift": Dense(Lf) if Lf else None, "lift_grasp": Dense(Lf[::-1]) if Lf else None}
 
+    grasp_plan = _timed(grasp_plan, "run/grasp_plan (plan_grasp + checks)")
+
+    def cart_line(q_from, q_to, steps=10, name=""):
+        """q_from の手先から q_to の手先へ、手先の姿勢を空間の直線（向きは測地線）で steps 等分し、前の段から IK で解いた細かい軌道。
+        関節の直線で差し込むと、開いた爪が横へ振れて立てた丸太を押した（2026-11-25 18:32）。解けない・1 段で 10° を超えて跳ぶなら止める。"""
+        M0, M1 = ik.fk(np.deg2rad(q_from)), ik.fk(np.deg2rad(q_to))
+        # ik.fk は手先（hand_tcp）の姿勢。IK も同じ手先で解く
+        dv = pin.log6(M0.inverse() * M1)
+        path, prev = [list(q_from)], np.deg2rad(q_from)
+        for f in np.linspace(0.0, 1.0, steps + 1)[1:]:
+            T = M0 * pin.exp6(dv * f)
+            q, ok, _, _ = ik.solve(T, prev, position_only=False, max_iter=300)
+            if not ok or not ik.within_limits(q) or np.max(np.abs(np.rad2deg(q - prev))) > 10.0:
+                raise SystemExit(f"[run] {name}: 手先の直線が解けない（{f * 100:.0f} %）。動かさない")
+            path.append(list(np.rad2deg(q))); prev = q
+        # 終わりは手先が同じ姿勢で、肘の角度だけ違うことがある（7 関節）。15° 以内なら、手先を止めたまま計画の姿勢へ寄せる 1 区間を足す
+        # （2026-11-25 Shreyan: 前は 3° を超えると止めていた）。それより違えば止める
+        d_end = max(abs(x - y) for x, y in zip(path[-1], q_to))
+        if d_end > 15.0:
+            raise SystemExit(f"[run] {name}: 手先の直線の終わりが計画の姿勢と {d_end:.0f}° 違う。動かさない")
+        if d_end > 0.5:
+            path.append(list(q_to))
+        else:
+            path[-1] = list(q_to)
+        return path
+
+    def legacy_gp():
+        """--approach-fallback: plan_grasp の代わり。raise ↔ pregrasp は区間ごとに確かめ（当たれば回り込む）、差し込み・持ち上げは手先の直線
+        （cart_line）で、どれも床・keep-out・cuRobo で確かめる。plan_grasp と同じ形で返す（動かし方は同じ道を通る）。"""
+        up_pre = route(up, pre, "raise→pregrasp"); pre_up = route(pre, up, "pregrasp→raise")
+        avoid_target(False)  # 差し込みと持ち上げは物に触れる区間（plan_grasp の grasp 段と同じく物は障害物に入れない）
+        G = cart_line(pre, grasp, 10, "pregrasp→grasp")
+        check_dense(G, "pregrasp→grasp（手先の直線）", allow_low=True)
+        Lf = None
+        if not a.wrist_servo:
+            Lf = cart_line(grasp, lift, 10, "grasp→lift")
+            check_dense(Lf, "grasp→lift（手先の直線）", allow_low=True)
+        return {"up_pre": up_pre, "pre_up": pre_up, "pre_grasp": Dense(G), "grasp_pre": Dense(G[::-1]),
+                "grasp_lift": Dense(Lf) if Lf else None, "lift_grasp": Dense(Lf[::-1]) if Lf else None}
     gp = None
     home = None
     if a.home:
@@ -515,8 +648,15 @@ def main(argv=None, *, robot=None, plan_wait=None, t_trigger=None) -> int:
         up = raised_or_same(start) if home is not None else raised_some(start)
         route(start, up, "start→raise"); route(up, start, "raise→start")
         if use_gp:
-            gp = grasp_plan(up)  # 帰りは行きの逆なので同じ確かめで足りる
-        else:
+            try:
+                gp = grasp_plan(up)  # 帰りは行きの逆なので同じ確かめで足りる
+            except SystemExit as e:
+                if not a.approach_fallback:
+                    raise
+                print(f"[run] plan_grasp で近づけない（{e}）。区間ごとに確かめる動き（差し込み・持ち上げは手先の直線）で近づく", flush=True)
+                avoid_target(True)
+                gp = legacy_gp()
+        if gp is None:
             route(up, pre, "raise→pregrasp"); route(pre, up, "pregrasp→raise")
         avoid_target(False)  # ここから物の近くの区間と運ぶ区間
         if gp is None:
@@ -536,11 +676,15 @@ def main(argv=None, *, robot=None, plan_wait=None, t_trigger=None) -> int:
         print("[run] raise pose " + " ".join(f"{v:+.1f}" for v in up))
         print("[run] DRY RUN (add --go to move)"); return 0
 
+    _t = time.time()
     from lerobot.robots.openarm_follower import OpenArmFollower, OpenArmFollowerConfig
     from lerobot.motors.damiao.damiao_alignment import soft_move_to_position
     from grasp.motion import smooth_move_to_position
     from grasp.gravity import gravity_torque_fn
+    _TIMING.event("run/import lerobot", _t, time.time())
+    _t = time.time()
     grav = gravity_torque_fn(side)  # 手と爪の質量入り（2026-11-23）
+    _TIMING.event("run/gravity model", _t, time.time())
     if side == "left":
         port, rid = os.environ.get("GRASP_CAN_PORT", "can_fol_l"), os.environ.get("GRASP_ROBOT_ID", "follower_left")
     else:  # 右は既定の値を持たない（上で無ければ止めている）
@@ -550,7 +694,9 @@ def main(argv=None, *, robot=None, plan_wait=None, t_trigger=None) -> int:
     if own_robot:
         robot = OpenArmFollower(OpenArmFollowerConfig(port=port, side=side, id=rid, align_on_connect=False, cameras={},
                                                       disable_torque_on_disconnect=not (a.hold_home and a.home)))
+        _t = time.time()
         robot.connect()
+        _TIMING.event("run/connect robot (CAN)", _t, time.time(), side=side)
     else:  # 常駐のプロセスが接続したまま渡したロボット（休みの姿勢で脱力している）。connect と同じくモーターを入れる
         robot.bus.enable_torque()
 
@@ -558,8 +704,9 @@ def main(argv=None, *, robot=None, plan_wait=None, t_trigger=None) -> int:
         """終わり: 自分で接続したなら切る（設定どおり脱力）。渡されたロボットは接続を残して脱力だけする（--hold-home は除く）。"""
         if own_robot:
             robot.disconnect()
-        elif not (a.hold_home and a.home):
+        elif not (a.hold_home and a.home) and not a.keep_torque:
             robot.bus.disable_torque()
+    release = _timed(release, "run/disconnect / torque off")
     obs = robot.get_observation(); start = [float(obs[f"{j}.pos"]) for j in J]
     print("[run] 今の腕の角度 " + ",".join(f"{v:.1f}" for v in start), flush=True)
     log = open(os.path.join(a.cap_dir, "traj.csv"), "w", newline=""); w = csv.writer(log)
@@ -581,7 +728,7 @@ def main(argv=None, *, robot=None, plan_wait=None, t_trigger=None) -> int:
         for _ in range(3 if correct else 0):
             o = robot.get_observation()
             err = {j: goal[j] - float(o[f"{j}.pos"]) for j in J}
-            if max(abs(v) for v in err.values()) < 1.0:
+            if max(abs(v) for v in err.values()) < (a.transit_tol if speed >= a.transit_dps else 1.0):
                 break
             for j in J:
                 cmd[j] = goal[j] + float(np.clip(cmd[j] - goal[j] + err[j], -15, 15))
@@ -593,6 +740,9 @@ def main(argv=None, *, robot=None, plan_wait=None, t_trigger=None) -> int:
         o = robot.get_observation(); e = max(abs(goal[j] - float(o[f"{j}.pos"])) for j in J)
         t_end = time.monotonic()
         print(f"[run] {phase} done (max joint error {e:.1f}°・動き {t_mv - t_go:.1f} 秒・補正 {n_fix} 回 {t_end - t_mv:.1f} 秒)", flush=True)
+        _off = time.time() - time.monotonic()  # go() は monotonic で測るので、記録の時刻だけ UNIX 秒に直す
+        _TIMING.event("arm/move", t_go + _off, t_mv + _off, phase=phase, speed_dps=speed, max_err_deg=round(e, 2))
+        _TIMING.event("arm/position correction", t_mv + _off, t_end + _off, phase=phase, n_fix=n_fix)
 
     def replan_place_from_grasp(carry_q, place_q, r_lc, r_cu):
         """閉じた直後の実際の角度で、運ぶ・置く姿勢を解き直す（2026-11-22）。爪を閉じると手首（柔らかい制御）が木材に回され、
@@ -626,6 +776,8 @@ def main(argv=None, *, robot=None, plan_wait=None, t_trigger=None) -> int:
         moved = (l7(new[1]) @ np.linalg.inv(l7(place_q)))[:3, 3]
         print(f"[run] 置き先の解き直し: 閉じた後の差 最大 {d:.1f}° → 置く姿勢の手を {np.round(moved * 1000).tolist()} mm 動かした", flush=True)
         return new[0], new[1], r1, r2
+
+    replan_place_from_grasp = _timed(replan_place_from_grasp, "run/replan place after grasp")
 
     def plan_return(q_put):
         """置いた後の戻り（2026-11-23）: 爪の先が置いた物の上端 + 3 cm に来るまで（少なくとも 6 cm）真上へ上げる姿勢と、そこから
@@ -681,6 +833,8 @@ def main(argv=None, *, robot=None, plan_wait=None, t_trigger=None) -> int:
         except BaseException as e:  # noqa: BLE001  表のスレッドで受ける
             return {"err": e}
 
+    plan_return = _timed(plan_return, "run/plan return after place")
+
     def up_from(q_from, dz, max_change=40.0):
         """q_from の手先を向きを保って真上へ dz 上げた姿勢。Pinocchio の IK（q_from から）で解けなければ cuRobo の IK で解く
         （構えの違う解しか無いことがある・2026-11-23 重量計の上に置いた姿勢）。関節の変化が max_change [deg] を超える解は使わない
@@ -724,7 +878,9 @@ def main(argv=None, *, robot=None, plan_wait=None, t_trigger=None) -> int:
         送り直すと、かくかく動いた。経由点の間も当たりを確かめてあり、cuRobo の余裕 10 mm の中で通る）。--correct-vias で前の動き"""
         if isinstance(path, Dense):  # cuRobo の細かい軌道: 止まらずにたどり、終点で今までどおり位置を補正する
             from grasp.motion import follow_path
+            _t = time.time()
             follow_path(robot.bus, J, path, speed, gripper_deg=g, torque_ff_fn=grav)
+            _TIMING.event("arm/follow dense path", _t, time.time(), phase=phase, points=len(path), speed_dps=speed)
             go(path[-1], speed, g, phase)
             return
         for k, q in enumerate(path):
@@ -761,13 +917,28 @@ def main(argv=None, *, robot=None, plan_wait=None, t_trigger=None) -> int:
         # --early の戻り（raise→start）は、上がってきた真上の線を逆にたどる（物はその間に動いていない。2026-11-23: 休みの姿勢の
         # 爪のすぐ横に物があると、休みの姿勢そのものが拾う物の箱（余白込み）に入り、物を入れた経路は作れない）
         if use_gp:
-            gp = grasp_plan(up)
+            try:
+                gp = grasp_plan(up)
+            except SystemExit as e:
+                if not a.approach_fallback or type(e).__name__ == "MotorLost":
+                    raise
+                print(f"[run] plan_grasp で近づけない（{e}）。区間ごとに確かめる動き（差し込み・持ち上げは手先の直線）で近づく", flush=True)
+                avoid_target(True)
+                gp = legacy_gp()
+        if gp is not None:
             r_up_pre, r_pre_up = gp["up_pre"], gp["pre_up"]
         else:
             r_up_pre = route(up, pre, "raise→pregrasp"); r_pre_up = route(pre, up, "pregrasp→raise")
         avoid_target(False)  # 運ぶ区間は物が手と動く。物の近くの区間（check）も、これより後は物を障害物に入れない
+        if gp is None:  # 前の動き: 物の近くの区間も、乾式と同じく動く前に確かめる（2026-11-25 Shreyan・前は実機の回では確かめていなかった）
+            check(pre, grasp, "pregrasp→grasp", allow_low=True)
+            if not a.wrist_servo:
+                check(grasp, lift, "grasp→lift", allow_low=True)
         if carry is not None:
             r_lift_carry = route(lift, carry, "lift→carry"); r_carry_up = route(carry, up, "carry→raise")
+            check(carry, place, "carry→place", allow_low=True); check(place, carry, "place→carry", allow_low=True)
+
+    prep_plan = _timed(prep_plan, "run/prep plan (obstacles + grasp path + carry routes)")
 
     def early_start():
         """--early: 真上へ上げて爪を開く間に、裏のスレッドで計画を待ち、計画に頼る準備を済ませる。
@@ -854,13 +1025,18 @@ def main(argv=None, *, robot=None, plan_wait=None, t_trigger=None) -> int:
             raise
         if early_start() != 0:
             return 1
+    _t_pre = time.time()
     if not a.early:
         try:  # 動く前の準備（経路を作る・カメラの背景）。ここで止まったら、腕を動かさずにモーターとの接続を切る
             if home is not None and not at_home:
                 up0 = raised(start); r_rest_up = route(start, up0, "rest→raise"); r_up_home = route(up0, home, "raise→home")
                 r_home_up0 = route(home, up0, "home→raise over rest")
             # 動く前に移動の区間の経路を全部作る（回り込みを作れない区間があれば、腕を動かす前に止まる）
-            up = raised_or_same(s0) if home is not None else raised_some(s0)
+            if a.hover and tcp_z(s0) > FLOOR_Z + HOVER_TCP_MIN:  # 前の回が上げた姿勢で止まっている: もう上げない
+                up = list(s0)
+                print(f"[run] --hover: 上げた姿勢から始める（爪の中心が机から {(tcp_z(s0) - FLOOR_Z) * 100:.1f} cm）。もう上げない", flush=True)
+            else:
+                up = raised_or_same(s0) if home is not None else raised_some(s0)
             r_start_up = route(s0, up, "start→raise"); r_up_start = route(up, s0, "raise→start")
             prep_plan()
             watcher = None
@@ -892,6 +1068,8 @@ def main(argv=None, *, robot=None, plan_wait=None, t_trigger=None) -> int:
                 wcam.close()
             release(); log.close()
             raise
+    _TIMING.event("run/pre-motion total (routes + checks before the arm moves)", _t_pre, time.time())
+    _t_motion = time.time()
     done = holding = motor_lost = False
     try:
         if home is not None:  # yesterday's start pose for every trial (Sota 11/20)
@@ -901,7 +1079,8 @@ def main(argv=None, *, robot=None, plan_wait=None, t_trigger=None) -> int:
             start = home
         if not a.early:  # --early では early_start が済ませた
             go_route(r_start_up, TR, g_now, "raise")
-            go(up, TR, G_OPEN, "open gripper")
+            if not a.open_during_approach:  # 開くのは次の raise → pregrasp の動きの間（go_route に G_OPEN を渡している）
+                go(up, TR, G_OPEN, "open gripper")
         go_route(r_up_pre, TR, G_OPEN, "pregrasp")
         if a.wrist_servo:
             try:
@@ -1028,6 +1207,7 @@ def main(argv=None, *, robot=None, plan_wait=None, t_trigger=None) -> int:
                 go(pre, NR, G_OPEN, "back to pregrasp")
             go_route(r_pre_up, TR, G_OPEN, "back to raise")
         done = True
+        _TIMING.event("arm/trial motion (raise → place → back to raise)", _t_motion, time.time())
     except SystemExit as e:
         # 非常停止・電源断（ここの MotorLost と grasp/reactive.py の MotorLost の両方）: 戻る動きもしない
         # （指令が届かない・電源が戻った瞬間に跳ぶ）。ほかの SystemExit は今までどおり戻りの処理へ
@@ -1043,7 +1223,9 @@ def main(argv=None, *, robot=None, plan_wait=None, t_trigger=None) -> int:
             if motor_lost:
                 raise SystemExit(1)
             g_end = g_now if g_now > -10 else G_OPEN
-            if done:  # raise にいる: 作っておいた経路で戻る
+            if done and a.hover:  # raise で止まる（次の回はここから始める）
+                print("[run] --hover: 休みの姿勢へ下ろさず、上げた姿勢で止まる", flush=True)
+            elif done:  # raise にいる: 作っておいた経路で戻る
                 go_route(r_up_start, TR, g_end, "back to start")
             else:  # 途中で止めた: 今の位置から経路を作り直す。作れなければ今までどおり直線で戻る
                 o = robot.get_observation(); q_now = [float(o[f"{j}.pos"]) for j in J]
@@ -1098,7 +1280,8 @@ def main(argv=None, *, robot=None, plan_wait=None, t_trigger=None) -> int:
             if motor_lost:
                 print("[run] モーターの返事が途切れたので、戻る動きはしていない（腕は止まった所）", flush=True)
             else:
-                print("[run] back at start, " + ("holding (torque on)" if (a.hold_home and home is not None) else "torque off"), flush=True)
+                print("[run] back at start, " + ("holding (torque on)" if ((a.hold_home and home is not None) or a.keep_torque)
+                                                 else "torque off"), flush=True)
     return 0
 
 

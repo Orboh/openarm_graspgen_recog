@@ -17,6 +17,9 @@ from grasp.curobo.model import ARM_JOINTS, robot_cfg_dict
 # まとめた直線でも余裕が残るようにする。腕の球そのものは広げない: 広げると、物の近くの端の姿勢（待機の姿勢など）が
 # cuRobo には当たって見えて計画が始まらない（2026-11-21 の試しで 15 mm 広げると 10 組中 5 組が端で弾かれた）
 PLAN_ACTIVATION = float(os.environ.get("GRASP_CUROBO_PLAN_ACTIVATION", "0.025"))
+# 立てるときに graph planner（RRT）も温めるか。温めると 1 つで約 2.5 GB を持ち続ける（0 にすると、初めて graph を使うときに作る）。
+# 2026-11-25 Shreyan: 8 GB の GPU で右腕のサーバーも回り込みを作れるようにするため（右腕は --no-detour で、拾う物の箱に掛かる区間で止まっていた）
+WARM_GRAPH = os.environ.get("GRASP_CUROBO_WARM_GRAPH", "1") != "0"
 # 本体にねじ止めしてあり、いつも本体に触れている link は経路計画の当たり判定から外す
 PLAN_DISABLE_LINKS = ["openarm_left_link0"]
 
@@ -55,7 +58,7 @@ class DetourPlanner:
         )
         self.mp = MotionPlanner(cfg)
         self.mp.disable_link_collision(PLAN_DISABLE_LINKS)
-        self.mp.warmup(enable_graph=True, num_warmup_iterations=2)
+        self.mp.warmup(enable_graph=WARM_GRAPH, num_warmup_iterations=2)
         self.joint_names = list(self.mp.joint_names)
 
     def update_world(self, world: Dict) -> None:

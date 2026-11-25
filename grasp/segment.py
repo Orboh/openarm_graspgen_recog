@@ -91,8 +91,14 @@ def _yoloe():
     """YOLOE-26 を 1 度だけ読み込む（常駐の resident_plan.py で毎回読み直さない）。重みは GRASP_YOLOE_WEIGHTS で差し替える。"""
     global _YOLOE
     if _YOLOE is None:
+        import time
+        from grasp import timing  # 段ごとの時間（記録だけ・2026-11-25 Shreyan）
+        _t0 = time.time()
         from ultralytics import YOLOE
+        _t1 = time.time()
         _YOLOE = YOLOE(os.environ.get("GRASP_YOLOE_WEIGHTS", "yoloe-26l-seg-pf.pt"))
+        timing.event("yoloe/import ultralytics", _t0, _t1)
+        timing.event("yoloe/load weights", _t1, time.time())
     return _YOLOE
 
 
@@ -101,9 +107,16 @@ def segment_object_frames(cap_dir: str, p: SegParams = SegParams(), return_debug
     Used by thor_snap.py's --yoloe / pick_target, which classifies only the winning mask's material afterward."""
     color_path = os.path.join(cap_dir, "color.png")
     device = os.environ.get("GRASP_RECOG_DEVICE", "cuda")
-    segmented_objects = _yoloe().predict(source=color_path, save=True, save_txt=True, conf=0.25, device=device,
-                                         project=cap_dir, name="segmentation", exist_ok=True, verbose=False)
+    import time
+    from grasp import timing  # 段ごとの時間（記録だけ・2026-11-25 Shreyan）
+    _t0 = time.time()
+    _model = _yoloe()
+    _t1 = time.time()
+    segmented_objects = _model.predict(source=color_path, save=True, save_txt=True, conf=0.25, device=device,
+                                       project=cap_dir, name="segmentation", exist_ok=True, verbose=False)
     r = segmented_objects[0]
+    timing.event("yoloe/get model (load if first)", _t0, _t1)
+    timing.event("yoloe/predict", _t1, time.time(), device=device, masks=0 if r.masks is None else len(r.masks.data))
     print(f"masks found: {0 if r.masks is None else len(r.masks.data)}")
     return segmented_objects
 

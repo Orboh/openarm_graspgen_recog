@@ -153,6 +153,9 @@ def serve(addr, snap, process, cam=None):
     {"op": "capture"} → 撮って保存 → {"cap": <回のフォルダ>, "name", "times"}
     {"op": "plan", "name": <回の名前>, "q": "j1,...,j7"} → 切り出し・計画・置き先 → {"cap", "planned", "place", "summary", "times", "total_s"}
     {"op": "record_start", "path": <mp4>, "fps": 15} → 胸のカメラを録り始める・{"op": "record_stop"} → 止めて閉じる
+    {"op": "run", "script": "plan" | "place" | "dual", "argv": [...], "env": {...}} → grasp/plan.py か grasp/tools/plan_place.py の main を
+      このプロセスで回す → {"rc", "stdout"}（2026-11-25 Shreyan・run_pipeline.sh が使う: 毎回の Python の起動と import を払わず、
+      GraspGenX の接続も温まったまま（1 回目 1.7 秒 → 2 回目から 0.34 秒）。env は呼ぶ前に os.environ に入れる）
     {"op": "ping"} → {"ok": true}。失敗は {"error": "..."}（腕を動かす側は計画が立たなかったとみなす）"""
     import zmq
     sock = zmq.Context.instance().socket(zmq.REP)
@@ -176,6 +179,17 @@ def serve(addr, snap, process, cam=None):
             elif op == "record_stop" and cam is not None:
                 rep = cam.stop_record()
                 print(f"[resident] 録画を止めた: {rep}", flush=True)
+            elif op == "run":
+                from grasp import plan as _plan
+                from grasp.tools import plan_place as _place
+                from grasp import dual as _dual  # 両腕を同時に動かしてよいか（2026-11-25 Shreyan）
+                mod = {"plan": _plan, "place": _place, "dual": _dual}[req["script"]]
+                for kk, vv in (req.get("env") or {}).items():
+                    os.environ[str(kk)] = str(vv)
+                t0 = time.time()
+                rc, out = call_main(mod, [str(x) for x in req["argv"]])
+                rep = {"rc": rc, "stdout": out}
+                print(f"[resident] run {req['script']} rc={rc}（{time.time() - t0:.2f} 秒）", flush=True)
             elif op == "plan":
                 k += 1
                 rep = process(k, req["name"], {}, time.time(), q=req.get("q"), q_right=req.get("q_right"))

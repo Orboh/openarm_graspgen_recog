@@ -21,6 +21,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 import numpy as np
 
@@ -29,6 +30,7 @@ from grasp import remote  # noqa: E402
 from grasp.capture import depth_to_points  # noqa: E402
 from grasp import objects  # noqa: E402
 from grasp.segment import SegParams, segment_clusters  # noqa: E402
+from grasp import timing  # noqa: E402  段ごとの時間（記録だけ・2026-11-25 Shreyan）
 
 THOR = remote.HOST  # 既定は東京の Thor。腕とカメラがこの PC にあるなら GRASP_ROBOT_HOST=local（grasp/remote.py）
 
@@ -229,10 +231,14 @@ def pick_target(a, img, depth, K, tbc, d):
     if not os.path.exists(tbc):
         raise RuntimeError("no hand-eye (T_base_cam) to place the floor / rank by distance to the robot")
     T = np.array(json.load(open(tbc))["T_base_cam"])
+    _t = time.time()
     nb, db = floor_plane_base(d, T)
+    timing.event("snap/floor plane (RANSAC)", _t, time.time())
     n = T[:3, :3].T @ nb; dd = float(db + nb @ T[:3, 3])  # camera frame: height = n·p + dd
 
+    _t = time.time()
     r = segment_object_frames(d)[0]
+    timing.event("snap/yoloe (load+predict)", _t, time.time())
     if r.masks is None or len(r.masks.data) == 0:
         raise RuntimeError("YOLOE found no objects in this frame")
     masks = r.masks.data.cpu().numpy() > 0.5
@@ -241,6 +247,7 @@ def pick_target(a, img, depth, K, tbc, d):
     v, u = np.mgrid[0:depth.shape[0], 0:depth.shape[1]]
     P_all = np.stack([(u - K[0, 2]) * depth / K[0, 0], (v - K[1, 2]) * depth / K[1, 1], depth], -1)
 
+    _t_masks = time.time()
     full = [cv2.resize(m.astype(np.uint8), (depth.shape[1], depth.shape[0]), interpolation=cv2.INTER_NEAREST).astype(bool)
             if m.shape != depth.shape else m for m in masks]
     # 2 つ以上の mask が取り合う画素は、いちばん小さい mask のものにする（物はマット・台の上に載っている。2026-11-23: 前は
@@ -306,6 +313,8 @@ def pick_target(a, img, depth, K, tbc, d):
                      "top": float(np.percentile(pts @ n + dd, 90)),
                      "centroid": centroid, "radius": float(np.percentile(np.linalg.norm(pb[:, :2] - centroid, axis=1), 90)),
                      "material": None, "mat_conf": None, "det_conf": float(confs[i])})
+    timing.event("snap/masks → 3D candidates", _t_masks, time.time(), masks=len(full), cands=len(cands))
+    _t_filt = time.time()
     if os.environ.get("GRASP_SNAP_DEBUG"):
         for c in cands:
             ys_, xs_ = np.where(c["mask"])
@@ -342,8 +351,10 @@ def pick_target(a, img, depth, K, tbc, d):
         if len(keep) < len(cands):
             print(f"[snap] yoloe: 腕・爪として外した候補 {len(cands) - len(keep)} 個", flush=True)
         cands = keep
+    timing.event("snap/band+exclude+self filters", _t_filt, time.time(), cands=len(cands))
     if not cands:
         raise RuntimeError("no candidates survived depth/height/band/self filtering")
+    _t_iso = time.time()
 
     # 2026-11-23 Shreyan: 孤立の度合いは、中心と半径ではなく、切り出した物どうしの縁と縁の距離で測る（机に沿った XY の最短距離）。
     # 中心と半径では、大きい物（重量計・長いバー）の半径がほかの物まで届き、どれも孤立と見なされなかった
@@ -364,6 +375,7 @@ def pick_target(a, img, depth, K, tbc, d):
     # 孤立した物が先。孤立した物の中では、ロボットからいちばん遠い物が先。孤立した物が無ければ、積みのいちばん上（床から高い物）が先
     cands.sort(key=lambda c: (not c["isolated"], -c["dist_robot"] if c["isolated"] else -c["top"]))
     best = cands[0]  # target is decided by geometry alone -- material has no vote
+    timing.event("snap/isolation + ranking", _t_iso, time.time(), cands=len(cands))
 
     # NOW classify, once, only the winner -- the losers' material is never needed, so it's never computed
     ys, xs = np.where(best["mask"])
@@ -374,9 +386,12 @@ def pick_target(a, img, depth, K, tbc, d):
     crop = img[y0:y1, x0:x1].copy()
     crop[~best["mask"][y0:y1, x0:x1]] = 128
     cv2.imwrite(os.path.join(d, "material_crop.png"), crop)
+    _t = time.time()
     best["material"], best["mat_conf"] = classify_material(crop)
+    timing.event("snap/siglip (load+classify)", _t, time.time())
     best["mat_conf"] = float(best["mat_conf"])
 
+    _t_save = time.time()
     cv2.imwrite(os.path.join(d, "mask.png"), (best["mask"].astype(np.uint8) * 255))
     np.savez_compressed(os.path.join(d, "cand_masks.npz"), masks=np.stack([c["mask"] for c in cands]))  # 候補の順（pick.json の cands と同じ）
     summary = [{k: v for k, v in c.items() if k not in ("mask", "pts", "pb")} for c in cands]
@@ -388,6 +403,7 @@ def pick_target(a, img, depth, K, tbc, d):
     for i, c in enumerate([c for c in cands if c is not best][:4]):
         np.save(os.path.join(d, f"object_alt_{i}.npy"), c["pts"].astype(np.float32))
 
+    timing.event("snap/save pick outputs", _t_save, time.time())
     ext = best["pts"].max(0) - best["pts"].min(0)
     return best["pts"].astype(np.float32), (
         f"{best['material']} ({best['mat_conf']:.2f}) {'isolated' if best['isolated'] else 'heap'} "
@@ -397,7 +413,10 @@ def pick_target(a, img, depth, K, tbc, d):
 
 
 def main(argv=None) -> int:
+    timing.startup()
+    _t = time.time()
     import cv2
+    timing.event("snap/import cv2", _t, time.time())
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--rows", default="0:480", help="image rows to use v0:v1 (cuts out the arm's own hands at the bottom of the frame)")
@@ -470,6 +489,7 @@ def main(argv=None) -> int:
         name = r.stdout.strip()
         remote.get(f"grasp_runs/{name}", RUNS)
     d = os.path.join(RUNS, name)
+    _t = time.time()
     depth = np.load(os.path.join(d, "depth.npy"))
     K = np.array(json.load(open(os.path.join(d, "intrinsics.json")))["K"])
     img = cv2.imread(os.path.join(d, "color.png"))
@@ -478,6 +498,8 @@ def main(argv=None) -> int:
     for stale in ("object.npy", "target.json"):  # --cap で撮り直さずに切り直すとき、前の結果を残さない
         if os.path.exists(os.path.join(d, stale)):
             os.remove(os.path.join(d, stale))
+    timing.event("snap/load capture", _t, time.time())
+    _t = time.time()
     v0, v1 = map(int, a.rows.split(":")); u0, u1 = map(int, a.cols.split(":"))
     dm = np.zeros_like(depth); dm[v0:v1, u0:u1] = depth[v0:v1, u0:u1]
     if spec is not None and not a.no_separate and spec["separate_from"]:  # 触れている相手（例: 木片の隣のアルミ）と分ける
@@ -497,6 +519,8 @@ def main(argv=None) -> int:
     tbc = os.environ.get("GRASP_T_BASE_CAM", os.path.join(os.path.dirname(__file__), "..", "config", "T_base_cam.json"))
     if os.environ.get("GRASP_SITE") and "GRASP_T_BASE_CAM" not in os.environ:  # 東京のハンドアイで腕の届く範囲を切らない
         tbc = ""
+    timing.event("snap/depth→points", _t, time.time())
+    _t = time.time()
     segs = []
     if (a.self_q or a.self_q_right) and os.path.exists(tbc):
         for qs, sd in ((a.self_q, "left"), (a.self_q_right, "right")):
@@ -519,7 +543,9 @@ def main(argv=None) -> int:
         floor_like = pb[:, 2] < np.percentile(pb[:, 2], 60)   # keep the floor for plane removal
         inb = (pb[:, 0] > x0) & (pb[:, 0] < x1) & (pb[:, 1] > y0) & (pb[:, 1] < y1)
         pts = pts[inb | floor_like]
+    timing.event("snap/self-arm segments + point filters (pinocchio FK)", _t, time.time())
     msg = ""
+    _t_pick = time.time()
     if a.yoloe:
         a._self_segs = segs  # pick_target で腕の線から近い候補を外す
         try:
@@ -589,6 +615,8 @@ def main(argv=None) -> int:
         np.save(os.path.join(d, "object.npy"), obj)
       except RuntimeError as e:
         msg = f"segment failed: {e}"
+    timing.event("snap/target selection (yoloe・perceive・clusters)", _t_pick, time.time(), ok=os.path.exists(os.path.join(d, "object.npy")))
+    _t = time.time()
     cv2.rectangle(img, (u0, v0), (u1 - 1, v1 - 1), (255, 200, 0), 1)
     cv2.putText(img, name, (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
     cv2.putText(img, msg, (6, 470), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
@@ -596,6 +624,7 @@ def main(argv=None) -> int:
     out = os.path.join(RUNS, "latest.jpg")
     cv2.imwrite(out, np.hstack([img, dv]))
     cv2.imwrite(os.path.join(d, "overlay.jpg"), np.hstack([img, dv]))
+    timing.event("snap/overlay images", _t, time.time())
     print(name, "|", msg)
     if not a.no_view:
         running = subprocess.run(["pgrep", "-f", "eog .*latest.jpg"], capture_output=True).returncode == 0

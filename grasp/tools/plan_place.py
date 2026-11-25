@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import sys
+import time
 
 import numpy as np
 
@@ -26,6 +27,7 @@ import pinocchio as pin  # noqa: E402
 
 from grasp.plan import CFG, floor_plane_base, t_l7_g  # noqa: E402
 from ik.openarm_left_ik import OpenArmIK  # noqa: E402
+from grasp import timing  # noqa: E402  段ごとの時間（記録だけ・2026-11-25 Shreyan）
 
 # reach band x visible area (base frame, metres), from the 11/20 reach / visibility maps
 SPOTS = [(x, y) for x in (0.37, 0.40, 0.43) for y in (0.00, 0.04, 0.08, 0.12)]  # y=+0.16 dropped: 3 misses in a row there (iter_034)
@@ -35,10 +37,15 @@ LIMIT_MARGIN_DEG = float(os.environ.get("GRASP_PLACE_LIMIT_MARGIN", "5.0"))  # -
 
 def main(argv=None) -> int:
     """cuRobo の IK は先に LM の段だけで解き（速い）、置き方が 1 つも残らなければ L-BFGS まで全部まわして解き直す（2026-11-23）。"""
+    timing.startup()
+    _t = time.time()
     rc = _main(argv, lm_only=True)
+    timing.event("place/solve (LM only)", _t, time.time(), rc=rc)
     if rc != 0 and os.environ.get("GRASP_PLAN_IK") == "curobo" and "--no-full-retry" not in (argv or sys.argv[1:]):
         print("[place] LM の段だけでは置き方が残らなかった。IK を全部まわして解き直す")
+        _t = time.time()
         rc = _main(argv, lm_only=False)
+        timing.event("place/solve (full IK retry)", _t, time.time(), rc=rc)
     return rc
 
 
@@ -115,7 +122,9 @@ def _main(argv=None, lm_only: bool = False) -> int:
         1 個ずつ送ると向きの数だけ 1〜3 秒かかっていた（置き先 1 か所・25 向きで 35〜53 秒）。"""
         if not Ts:
             return []
+        _t = time.time()
         Q, OK = curobo.ik(np.stack([l7(T) for T in Ts]), seed_deg=np.rad2deg(np.stack(seeds)), return_seeds=8, lm_only=lm_only)
+        timing.event("place/curobo batch IK", _t, time.time(), targets=len(Ts), lm_only=lm_only)
         return [pick(Q[n], OK[n], seeds[n]) for n in range(len(Ts))]
 
     cache = {}  # (置き先の番号, 向き, "place" か "carry") → 解。use_curobo のときだけ先にまとめて解く

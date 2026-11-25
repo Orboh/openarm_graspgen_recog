@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import sys
+import time
 
 import numpy as np
 
@@ -33,6 +34,7 @@ from grasp.curobo import client as curobo  # noqa: E402  GRASP_CUROBO がある�
 from grasp.depth import grasp_depths, jaw_clearance  # noqa: E402
 from grasp.infer import infer_grasps, infer_graspnet, load_sweep, scene_cloud  # noqa: E402
 from ik.openarm_left_ik import OpenArmIK  # noqa: E402
+from grasp import timing  # noqa: E402  段ごとの時間（記録だけ・2026-11-25 Shreyan）
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CFG = json.load(open(os.environ.get("GRASP_GRIPPER_JSON", os.path.join(HERE, "config", "openarm_left_gripper.json"))))  # 置き場の爪は grasp/config/sites/
@@ -139,9 +141,16 @@ def main(argv=None) -> int:
     ap.add_argument("--max-tilt", type=float, default=60.0, help="allowed tilt of the approach from straight down [deg] (on the floor, straight-down only reaches up to x≈0.35 m)")
     ap.add_argument("--pregrasp", type=float, default=0.10)
     ap.add_argument("--lift", type=float, default=0.10)
+    ap.add_argument("--short-fallback", default=None,
+                    help="\"pregrasp,lift\" [m]（例 0.06,0.05）。--pregrasp・--lift でどの腕にも候補が無ければ、同じ候補をこの短い距離で解き直す"
+                         "（2026-11-25 Shreyan: 右腕の届く端の掴み方は、近づく向きに 10 cm 戻した手前の姿勢が届かず、IK の「3 つとも」が 0 だった。"
+                         "6・5 cm なら同じ候補で 3 つ解けた）。使った距離は plan.json の pregrasp_m・lift_m に書き、run_grasp.py がそれで近づく")
     ap.add_argument("--host", default="localhost")
     ap.add_argument("--floor-clear", type=float, default=0.012, help="minimum height of the lowest jaw-tip corner above the floor [m]")
     ap.add_argument("--center-tol", type=float, default=0.02, help="max horizontal distance from the grasp centre to the object's centre [m]")
+    ap.add_argument("--check-descent", action="store_true",
+                    help="pregrasp → 掴む・掴む → 持ち上げを手先の直線（10 段の IK）でたどれる候補だけ使う（2026-11-25 Shreyan: 左腕で、J3 が可動域の端の"
+                         "掴み方は真下へ差し込む直線が解けず、cuRobo の plan_grasp が作れなかった。関節の直線で差し込むと爪が横へ振れて立てた丸太を押した）")
     ap.add_argument("--max-branch-deg", type=float, default=45.0, help="max joint change between grasp and pre/lift [deg]")
     ap.add_argument("--wrist-near", default=None,
                     help="j6,j7,tol (lerobot deg): only use grasps whose J6/J7 at the grasp are within tol of these. The taught TCP "
@@ -178,6 +187,7 @@ def main(argv=None) -> int:
     ap.add_argument("--prefer", default="-17.7,2.0,4.7,28.1,-8.3,-15.5,-28.9",
                     help="preferred posture (lerobot degrees). Among IK solutions, pick the one closest to this (avoids odd branches like an elbow flung outward)")
     a = ap.parse_args(argv)
+    timing.startup()
 
     obj = np.load(os.path.join(a.cap_dir, "object.npy"))
     if os.environ.get("GRASP_SITE") and "GRASP_T_BASE_CAM" not in os.environ:  # 東京のハンドアイで計画しない
@@ -198,8 +208,10 @@ def main(argv=None) -> int:
     else:
         Gs, Ss = [], []
         for k in range(a.rounds):  # diffusion samples differ each call, so pool several calls
+            _t = time.time()
             g, sc = infer_grasps(obj, sweep=load_sweep(SWEEP_JSON),
                                  host=a.host, num_grasps=400, topk=200, seed=k, sweep_num=a.per_call)
+            timing.event("plan/graspgenx infer", _t, time.time(), call=k, per_call=a.per_call, pts=len(obj), grasps=len(sc))
             Gs.append(g); Ss.append(sc)
         G, S = np.concatenate(Gs), np.concatenate(Ss)
         np.savez(cache, G=G, S=S)
@@ -210,7 +222,9 @@ def main(argv=None) -> int:
     tilt = np.degrees(np.arccos(np.clip(Gb[:, :3, 2] @ down, -1, 1)))
     # Floor clearance: in the first real run the lower jaw corner hit the floor (and pushed the robot/cart).
     # Fit the floor plane in the base frame from the capture, and drop grasps where the lowest jaw-tip corner is less than --floor-clear above the floor.
+    _t = time.time()
     n_b, d_b = floor_plane_base(a.cap_dir, T_bc)
+    timing.event("plan/floor plane", _t, time.time())
     arm_sel = a.arm or os.environ.get("GRASP_ARM", "left")
     if arm_sel not in ("left", "right", "both"):
         raise SystemExit(f"[plan] 腕は left・right・both: {arm_sel!r}")
@@ -219,7 +233,9 @@ def main(argv=None) -> int:
     if curobo.enabled() or os.environ.get("GRASP_CUROBO_RIGHT"):
         from grasp.curobo import seen
         # --ignore-seen では障害物にしないので計算しない（0.4 秒・2026-11-23）。run_grasp.py が記録の有無を見るので空で残す
+        _t = time.time()
         P_obs = np.zeros((0, 3)) if (a.ignore_seen or a.obstacle_objects) else seen.seen_points(a.cap_dir, T_bc, obj, n_b, d_b)
+        timing.event("plan/seen obstacle points", _t, time.time())
         np.save(os.path.join(a.cap_dir, seen.POINTS_FILE), P_obs)
 
     def prepare_curobo(side):
@@ -260,6 +276,7 @@ def main(argv=None) -> int:
                   open(os.path.join(a.cap_dir, bf), "w"), indent=1)
         print(f"[plan:{side}] cuRobo: カメラで見た障害物の箱 {len(r['boxes'])} 個（点 {r['n_in']} → 腕を消して {r['n_after_arm']}）"
               + "".join(f" {b['name']} 中心 {np.round(b['pose'][:3], 2).tolist()} 大きさ {np.round(b['dims'], 2).tolist()}" for b in r["boxes"]))
+    _t_filters = time.time()
     tip_off = CFG["flange_to_tip_m"]
     def lowest_corner(Tg):
         tip = Tg[:3, 3] + tip_off * Tg[:3, 2]
@@ -381,6 +398,8 @@ def main(argv=None) -> int:
              and (a.jaw_clear is None or jclr[i] >= a.jaw_clear)
              and depth[i] >= a.min_depth
              and S[i] >= a.min_score]
+    timing.event("plan/candidate filters (tilt・floor・centre・jaw clearance・depth)", _t_filters, time.time(),
+                 candidates=len(S), kept=len(order))
     print(f"[plan] floor normal (base) {np.round(n_b,3).tolist()}; {int(np.sum(clear >= a.floor_clear))} candidates keep ≥{a.floor_clear*100:.0f} cm clearance")
     print(f"[plan] {len(S)} candidates, {len(order)} from above (≤{a.max_tilt:.0f}°)")
 
@@ -402,9 +421,13 @@ def main(argv=None) -> int:
     def search(side):
         """その腕で、点数の順に pregrasp・grasp・lift が全部解ける最初の候補を探す → result（無ければ None）。"""
         os.environ["GRASP_ARM"] = side
+        _t = time.time()
         prepare_curobo(side)
+        timing.event(f"plan/{side}/curobo set obstacles", _t, time.time())
         T_L7_G = t_l7_g(side)
+        _t = time.time()
         ik = OpenArmIK(side=side)
+        timing.event(f"plan/{side}/build pinocchio IK", _t, time.time())
         q0 = np.deg2rad(start_q(side))
         rng = np.random.default_rng(0)
         mid = armcfg.mirror_q if side == "right" else (lambda x: np.asarray(x, float))
@@ -417,7 +440,8 @@ def main(argv=None) -> int:
                 seeds.insert(0, np.deg2rad([float(x) for x in v.split(",")]))
         q_pref = np.deg2rad(prefer_q(side))
         seeds.insert(0, q_pref)
-        return _search(side, ik, T_L7_G, q0, q_pref, seeds)
+        with timing.stage(f"plan/{side}/search (IK + collision per candidate)"):
+            return _search(side, ik, T_L7_G, q0, q_pref, seeds)
 
     def ik_box(side):
         """計画で使ってよい関節の範囲（GRASP_IK_LIMITS(_RIGHT)="関節番号:下限:上限;..." [deg]）。無ければ可動域だけ。
@@ -488,9 +512,13 @@ def main(argv=None) -> int:
             print(f"[plan:{side}] cuRobo IK{'（LM の段だけ）' if lm_only else '（全部まわす）'}: 候補 {len(keys)} 個"
                   f"（掴む姿勢: 解けた {n_raw}・可動域の中 {n_lim}・絞りの中 {len(idx)}・3 つとも {len(out)}）（{_t.time() - t0:.2f} 秒）")
             return out
+        _tik = time.time()
         out = solve_all(True)
+        timing.event(f"plan/{side}/curobo batch IK", _tik, time.time(), lm_only=True, targets=len(keys), solved=len(out))
         if not out:  # LM の段で 1 つも残らなければ、L-BFGS まで全部まわして解き直す
+            _tik = time.time()
             out = solve_all(False)
+            timing.event(f"plan/{side}/curobo batch IK", _tik, time.time(), lm_only=False, targets=len(keys), solved=len(out))
         return out
 
     def _search(side, ik, T_L7_G, q0, q_pref, seeds):
@@ -506,7 +534,7 @@ def main(argv=None) -> int:
                         best = (d, q)
             return None if best is None else best[1]
         result = None
-        n_keepout = n_curobo = 0
+        n_keepout = n_curobo = n_descent = 0
         pre_ik = curobo_ik_all(side, ik, T_L7_G, q_pref, box_lo, box_hi) if use_curobo_ik() else None
         for rank, i in enumerate(order[:a.max_try]):
             for flip in (False, True):
@@ -533,13 +561,21 @@ def main(argv=None) -> int:
                 if ok_all and curobo.enabled():
                     # cuRobo の球の腕で、pre → grasp → lift を関節の直線で動かす途中が置き場の箱（本体のフレーム・机）に当たらないか
                     # （2026-11-21 北九州: 持ち上げの段で肘が本体のフレームに当たった。腕の点だけを見る keep-out の箱を置き換える）
+                    _t = time.time()
                     bad = curobo.violations([np.rad2deg(qs[1]), np.rad2deg(qs[0]), np.rad2deg(qs[2])],
                                             names=["pregrasp→grasp", "grasp→lift"], n=20)
+                    timing.event(f"plan/{side}/curobo path check (one candidate)", _t, time.time(), rank=rank, ok=not bad)
                     if bad:
                         ok_all = False
                         n_curobo += 1
                         if n_curobo <= 3:
                             print(f"[plan:{side}] cuRobo: 候補 {rank} を外す（{curobo.describe(bad)}）")
+                if ok_all and a.check_descent:  # qs はまだ [掴む, 手前, 持ち上げ] の順
+                    _td = time.time()
+                    if not (line_ok(ik, qs[1], qs[0]) and line_ok(ik, qs[0], qs[2])):
+                        ok_all = False
+                        n_descent += 1
+                    timing.event(f"plan/{side}/straight descent check (one candidate)", _td, time.time(), rank=rank, ok=ok_all)
                 q_look = None
                 if ok_all and a.look_back > 0:
                     Tlook = Tpre.copy(); Tlook[:3, 3] -= a.look_back * Tg[:3, 2]
@@ -564,10 +600,13 @@ def main(argv=None) -> int:
                                   q_grasp_deg=np.rad2deg(qs[1]).tolist(), q_lift_deg=np.rad2deg(qs[2]).tolist(),
                                   q_start_deg=np.rad2deg(q0).tolist(),
                                   q_look_deg=None if q_look is None else np.rad2deg(q_look).tolist(), look_back_m=a.look_back,
-                                  depth_m=None if not np.isfinite(depth[i]) else float(depth[i]))
+                                  depth_m=None if not np.isfinite(depth[i]) else float(depth[i]),
+                                  pregrasp_m=float(a.pregrasp), lift_m=float(a.lift))
                     break
             if result:
                 break
+        if a.check_descent:
+            print(f"[plan:{side}] straight descent: {n_descent} candidates dropped (pregrasp→grasp or grasp→lift is not a straight line the arm can follow)")
         if KEEPOUT:
             print(f"[plan:{side}] keep-out: {n_keepout} IK solutions dropped (the arm enters a keep-out box: {len(KEEPOUT)} box(es))")
         if curobo.enabled():
@@ -576,7 +615,15 @@ def main(argv=None) -> int:
             result["arm"] = side
         return result
 
+    _t = time.time()
     results = run_sides(search, sides)
+    timing.event("plan/search all arms", _t, time.time(), arms=",".join(sides))
+    if a.short_fallback and not any(results.values()):
+        a.pregrasp, a.lift = (float(v) for v in a.short_fallback.split(","))
+        print(f"[plan] 手前 10 cm・持ち上げ 10 cm では候補が無い。手前 {a.pregrasp * 100:.0f} cm・持ち上げ {a.lift * 100:.0f} cm で解き直す")
+        _t = time.time()
+        results = run_sides(search, sides)
+        timing.event("plan/search all arms (short pregrasp/lift)", _t, time.time(), arms=",".join(sides))
     for side, r in results.items():
         if r is not None:
             json.dump(r, open(os.path.join(a.cap_dir, f"plan_{side}.json"), "w"), indent=2)
@@ -600,8 +647,26 @@ def main(argv=None) -> int:
         print(f"  {k:12s} " + " ".join(f"{v:+6.1f}" for v in result[k]))
     print(f"  TCP {np.round(tcp,3).tolist()}  distance to nearest object point {d*1000:.0f} mm")
     if not a.no_render:  # 図（plan.png）は腕のメッシュの読み込みと描画で 2〜3 秒かかる（2026-11-21 北九州で測った）
+        _t = time.time()
         render(a.cap_dir, result, ob)
+        timing.event("plan/render plan.png", _t, time.time())
     return 0
+
+
+def line_ok(ik, q_a, q_b, steps: int = 10, max_jump_deg: float = 10.0) -> bool:
+    """q_a の手先から q_b の手先へ、手先の姿勢を空間の直線（向きは測地線）で steps 等分して、前の段から IK で解いて
+    たどれるか（どの段も可動域の中・1 段で max_jump_deg を超えて跳ばない）。run_grasp.py の cart_line と同じ考え方。
+    終わりの関節角は q_b と比べない（2026-11-25 Shreyan: 7 関節の腕は同じ手先の姿勢を肘の違う角度でも取れる。cuRobo が別に解いた持ち上げの
+    姿勢と 6.6° 違うだけで、たどれる直線の候補を全部落としていた）"""
+    M0, M1 = ik.fk(q_a), ik.fk(q_b)
+    dv = pin.log6(M0.inverse() * M1)
+    prev = np.asarray(q_a, float)
+    for f in np.linspace(0.0, 1.0, steps + 1)[1:]:
+        q, ok, _, _ = ik.solve(M0 * pin.exp6(dv * f), prev, position_only=False, max_iter=200)
+        if not ok or not ik.within_limits(q) or np.max(np.abs(np.rad2deg(q - prev))) > max_jump_deg:
+            return False
+        prev = q
+    return True
 
 
 def travel_deg(r) -> float:
@@ -623,6 +688,17 @@ def run_sides(fn, sides) -> dict:
     """腕ごとに fn(side) を回す。2 本なら別のプロセスで同時に（cuRobo のクライアントと IK を腕ごとに分けるため）。"""
     if len(sides) == 1:
         return {sides[0]: fn(sides[0])}
+    if os.environ.get("GRASP_PLAN_SEQUENTIAL"):
+        # 常駐のプロセス（resident_plan.py の run・カメラのスレッドを持つ）の中では fork しないで順に回す（2026-11-25 Shreyan）。
+        # 結果は同じ（腕ごとに search が GRASP_ARM と cuRobo のサーバーを切り替える）。片方の誤りで両方を落とさないのも同じ
+        out = {}
+        for sd in sides:
+            try:
+                out[sd] = fn(sd)
+            except Exception as e:  # noqa: BLE001
+                print(f"[plan:{sd}] 計算が止まった: {type(e).__name__}: {e}")
+                out[sd] = None
+        return out
     import multiprocessing as mp
     ctx = mp.get_context("fork")
     q = ctx.Queue()

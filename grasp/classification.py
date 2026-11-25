@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+import time
 
 import numpy as np
 
@@ -45,6 +46,7 @@ def _load():
     """
     global _MODEL
     if _MODEL is None:
+        _t0 = time.time()  # 段ごとの時間（記録だけ・2026-11-25 Shreyan）
         import torch
         from transformers import AutoModel, AutoProcessor
         processor = AutoProcessor.from_pretrained(model_id)
@@ -69,6 +71,8 @@ def _load():
                 torch.cuda.empty_cache()
                 print("[classify] GPU に載らなかったので SigLIP2 は CPU で動かす", flush=True)
         _MODEL = (processor, vision, tf, scale, bias, device)
+        from grasp import timing
+        timing.event("siglip/load (processor+model+text features+to device)", _t0, time.time(), device=device)
     return _MODEL
 
 
@@ -84,7 +88,9 @@ def classify_material(crop_bgr: np.ndarray) -> tuple[str, float]:
         float: The confidence score of the prediction.
     """
     import torch
+    _t0 = time.time()  # 段ごとの時間（記録だけ・2026-11-25 Shreyan）
     processor, vision, tf, scale, bias, device = _load()
+    _t1 = time.time()
     crop_rgb = crop_bgr[..., ::-1].copy()  # BGR → RGB
     pix = processor(images=crop_rgb, return_tensors="pt")["pixel_values"]
     dtype = torch.float16 if device != "cpu" else torch.float32
@@ -97,4 +103,7 @@ def classify_material(crop_bgr: np.ndarray) -> tuple[str, float]:
     per_class = torch.stack([logits[torch.from_numpy(owner == i)].mean() for i in range(len(candidates))])
     probs = per_class.softmax(0)
     pred_idx = int(probs.argmax())
+    from grasp import timing
+    timing.event("siglip/get model (load if first)", _t0, _t1)
+    timing.event("siglip/classify", _t1, time.time(), device=device, label=candidates[pred_idx])
     return candidates[pred_idx], float(probs[pred_idx])

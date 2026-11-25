@@ -47,6 +47,8 @@ def _context():
 
 
 def _call(req: Dict, timeout_ms: int = 10000) -> Dict:
+    import time
+    _t0 = time.time()  # 段ごとの時間（記録だけ・2026-11-25 Shreyan）: 問い合わせ 1 回の往復を op ごとに残す
     import msgpack
     import zmq
     host, _, port = ADDR.partition(":")
@@ -61,6 +63,11 @@ def _call(req: Dict, timeout_ms: int = 10000) -> Dict:
                          "grasp/curobo/server.py を立てるか、GRASP_CUROBO を外す")
     finally:
         sock.close()
+        try:
+            from grasp import timing
+            timing.event(f"curobo rpc/{req.get('op')}", _t0, time.time(), server=ADDR)
+        except Exception:  # noqa: BLE001  記録のために問い合わせを止めない
+            pass
     if "error" in rep:
         raise SystemExit(f"[curobo] サーバーの誤り: {rep['error']}")
     return rep
