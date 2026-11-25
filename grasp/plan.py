@@ -255,14 +255,33 @@ def main(argv=None) -> int:
         if a.obstacle_objects:
             import glob as _glob
             obj_boxes = []
+            # 拾う物の机に沿った外形（主成分の向きの箱・余白 1 cm）。ほかの物の点の 3 割より多くがこの中にあれば、同じ物の別の mask
+            # （容器の口・縁など）なので障害物にしない（2026-11-25 Shreyan: 容器の口が 5 × 4 cm の箱になって、爪の入る所をふさいでいた）
+            tb_xy = (obj @ T_bc[:3, :3].T + T_bc[:3, 3])[:, :2]
+            tc = tb_xy.mean(0); _w, _V = np.linalg.eigh(np.cov((tb_xy - tc).T)); tR = _V[:, ::-1]
+            t_lo, t_hi = np.percentile((tb_xy - tc) @ tR, 2, axis=0) - 0.01, np.percentile((tb_xy - tc) @ tR, 98, axis=0) + 0.01
             for k, f in enumerate(sorted(_glob.glob(os.path.join(a.cap_dir, "object_alt_*.npy")))):
                 pb = np.load(f) @ T_bc[:3, :3].T + T_bc[:3, 3]
                 if len(pb) < 20:
                     continue
-                lo, hi = np.percentile(pb, 2, axis=0) - 0.01, np.percentile(pb, 98, axis=0) + 0.01
-                lo[2] = min(lo[2], fz)  # 机まで
-                obj_boxes.append({"name": f"obj_{k}", "dims": (hi - lo).round(4).tolist(),
-                                  "pose": ((hi + lo) / 2).round(4).tolist() + [1.0, 0.0, 0.0, 0.0]})
+                loc_t = (pb[:, :2] - tc) @ tR
+                inside = float(np.mean(np.all((loc_t >= t_lo) & (loc_t <= t_hi), axis=1)))
+                if inside > 0.3:
+                    print(f"[plan] obj_{k}: 点の {inside * 100:.0f} % が拾う物の外形の中 → 同じ物の別の mask として障害物にしない")
+                    continue
+                # 物の机に沿った長い向き（主成分）に合わせて回した箱（2026-11-25 Shreyan: 斜めに置いた 24 cm のバーは、軸に沿った箱だと
+                # 27 × 12 cm になって隣の容器の掴み方の IK を 13 → 2 に減らした）。余白 1 cm・下端は机まで、は今までどおり
+                c_xy = pb[:, :2].mean(0)
+                w_, V_ = np.linalg.eigh(np.cov((pb[:, :2] - c_xy).T))
+                ax_ = V_[:, 1]; yaw = float(np.arctan2(ax_[1], ax_[0]))
+                Rz = np.array([[np.cos(yaw), -np.sin(yaw)], [np.sin(yaw), np.cos(yaw)]])
+                loc = (pb[:, :2] - c_xy) @ Rz  # 箱の向きの座標（u = 長い向き・v = 横）
+                lo_uv, hi_uv = np.percentile(loc, 2, axis=0) - 0.01, np.percentile(loc, 98, axis=0) + 0.01
+                z_lo, z_hi = min(float(np.percentile(pb[:, 2], 2)) - 0.01, fz), float(np.percentile(pb[:, 2], 98)) + 0.01
+                ctr = c_xy + Rz @ ((lo_uv + hi_uv) / 2)
+                obj_boxes.append({"name": f"obj_{k}", "dims": [round(float(v), 4) for v in (*(hi_uv - lo_uv), z_hi - z_lo)],
+                                  "pose": [round(float(ctr[0]), 4), round(float(ctr[1]), 4), round((z_lo + z_hi) / 2, 4),
+                                           round(float(np.cos(yaw / 2)), 6), 0.0, 0.0, round(float(np.sin(yaw / 2)), 6)]})
             curobo.set_obstacle_boxes(obj_boxes)
             r = {"boxes": obj_boxes, "n_in": 0, "n_after_arm": 0}
         elif a.ignore_seen:  # 2026-11-22: 周りの物に当たってもよいから目標を拾う方針。置き場の物（本体・カメラ・机・もう片方の腕）は見る

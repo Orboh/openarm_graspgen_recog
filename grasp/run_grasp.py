@@ -283,8 +283,15 @@ def main(argv=None, *, robot=None, plan_wait=None, t_trigger=None) -> int:
                 raise Blocked(f"[run] {name}: at s={s:.2f} link7 z={M.translation[2]:.3f} TCP z={tcp[2]:.3f}, too close to the floor. Stopping")
         if CUROBO is not None:
             # 机は、端の姿勢がもともと机に近い区間（机に寝かせた休みの姿勢）だけ「低い方の端 − 1 cm」まで許す（上の link7 と同じ考え方）
-            d_end = min(CUROBO.check_path([q], n=1)[0]["table/arm"][0] for q in (q_from, q_to))
+            ends = [CUROBO.check_path([q], n=1)[0] for q in (q_from, q_to)]
+            d_end = min(e["table/arm"][0] for e in ends)
             bad = CUROBO.violations([q_from, q_to], names=[name], table_margin=min(CUROBO.TABLE_MARGIN, d_end - 0.01))
+            # 拾う物の箱（target・物の外形 + 余白 --target-pad）だけは、区間の端（pregrasp など）がもともと余白の中にあるとき、
+            # 端より深く入らなければ通す（2026-11-25 Shreyan: 高さ 12 cm の容器で、手前の姿勢が箱の余白の 11 mm 内で止まっていた）。
+            # 端が物の外形そのものに入っているとき（余白より深い）は今までどおり止める
+            t_end = min((e["target"][0] for e in ends if "target" in e), default=None)
+            if bad and t_end is not None and -a.target_pad - 0.002 <= t_end < CUROBO.MARGIN:
+                bad = [b for b in bad if not (b[1] == "target" and b[2] >= t_end - 0.003)]
             if bad:
                 raise Blocked(f"[run] cuRobo: {CUROBO.describe(bad)}。腕が置き場の周りの物（本体・カメラ・机）に当たる。Stopping")
         if not quiet:
@@ -594,7 +601,7 @@ def main(argv=None, *, robot=None, plan_wait=None, t_trigger=None) -> int:
 
     grasp_plan = _timed(grasp_plan, "run/grasp_plan (plan_grasp + checks)")
 
-    def cart_line(q_from, q_to, steps=10, name=""):
+    def cart_line(q_from, q_to, steps=10, name="", keep_end=False):
         """q_from の手先から q_to の手先へ、手先の姿勢を空間の直線（向きは測地線）で steps 等分し、前の段から IK で解いた細かい軌道。
         関節の直線で差し込むと、開いた爪が横へ振れて立てた丸太を押した（2026-11-25 18:32）。解けない・1 段で 10° を超えて跳ぶなら止める。"""
         M0, M1 = ik.fk(np.deg2rad(q_from)), ik.fk(np.deg2rad(q_to))
@@ -607,6 +614,8 @@ def main(argv=None, *, robot=None, plan_wait=None, t_trigger=None) -> int:
             if not ok or not ik.within_limits(q) or np.max(np.abs(np.rad2deg(q - prev))) > 10.0:
                 raise SystemExit(f"[run] {name}: 手先の直線が解けない（{f * 100:.0f} %）。動かさない")
             path.append(list(np.rad2deg(q))); prev = q
+        if keep_end:  # 終わりは直線の解のまま（手先は q_to と同じ姿勢・肘の角度だけ違ってよい）
+            return path
         # 終わりは手先が同じ姿勢で、肘の角度だけ違うことがある（7 関節）。15° 以内なら、手先を止めたまま計画の姿勢へ寄せる 1 区間を足す
         # （2026-11-25 Shreyan: 前は 3° を超えると止めていた）。それより違えば止める
         d_end = max(abs(x - y) for x, y in zip(path[-1], q_to))
@@ -623,12 +632,17 @@ def main(argv=None, *, robot=None, plan_wait=None, t_trigger=None) -> int:
         （cart_line）で、どれも床・keep-out・cuRobo で確かめる。plan_grasp と同じ形で返す（動かし方は同じ道を通る）。"""
         up_pre = route(up, pre, "raise→pregrasp"); pre_up = route(pre, up, "pregrasp→raise")
         avoid_target(False)  # 差し込みと持ち上げは物に触れる区間（plan_grasp の grasp 段と同じく物は障害物に入れない）
-        G = cart_line(pre, grasp, 10, "pregrasp→grasp")
+        nonlocal grasp, lift
+        # 掴む姿勢と持ち上げは、手先の直線の終わりの解にする（手先の姿勢は計画と同じ・肘だけ違う。2026-11-25 Shreyan: 計画の関節角と 29° 違うので
+        # 止めていたが、7 関節の腕は同じ手先の姿勢を肘の違う角度で取れる）
+        G = cart_line(pre, grasp, 10, "pregrasp→grasp", keep_end=True)
         check_dense(G, "pregrasp→grasp（手先の直線）", allow_low=True)
+        grasp = list(G[-1])
         Lf = None
         if not a.wrist_servo:
-            Lf = cart_line(grasp, lift, 10, "grasp→lift")
+            Lf = cart_line(grasp, lift, 10, "grasp→lift", keep_end=True)
             check_dense(Lf, "grasp→lift（手先の直線）", allow_low=True)
+            lift = list(Lf[-1])
         return {"up_pre": up_pre, "pre_up": pre_up, "pre_grasp": Dense(G), "grasp_pre": Dense(G[::-1]),
                 "grasp_lift": Dense(Lf) if Lf else None, "lift_grasp": Dense(Lf[::-1]) if Lf else None}
     gp = None
@@ -1188,7 +1202,10 @@ def main(argv=None, *, robot=None, plan_wait=None, t_trigger=None) -> int:
                 if "err" in ret:
                     raise ret["err"]
                 go(ret["q_up"], PR, G_OPEN, "up from the new spot")
-                go_route(ret["route"], TR, G_OPEN, "back to raise")
+                if a.hover:  # 置いた所の上で止まり、次の物へはここから行く（休みの姿勢の上まで戻らない・2026-11-25 Shreyan）
+                    print("[run] --hover: 置いた所の上で止まる（次の回はここから始める）", flush=True)
+                else:
+                    go_route(ret["route"], TR, G_OPEN, "back to raise")
             else:
                 go(carry, PR, G_OPEN, "up from the new spot")
             if a.avoid:

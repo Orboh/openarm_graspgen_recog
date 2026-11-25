@@ -288,12 +288,29 @@ def pick_target(a, img, depth, K, tbc, d):
         # 2026-11-23 Shreyan: RANSAC の床（floor_plane_base）を、対象を選ぶ前の絞り込みにも使う。深度のある画素の大半が床の面の上
         # （|高さ| < --plane-dist）なら、床・マット・床の模様なので候補にしない。前は深度があっても上に点が足りないと下の
         # 「光って深度が無い」扱いに落ち、床から 2 cm 浮いた物として候補に戻っていた
+        flat_obj_h = None
         if valid.sum() >= 0.5 * m.sum() and np.mean(np.abs(h[valid]) < a.plane_dist) > a.plane_frac:
-            n_plane += 1
-            _why(i, "plane")
-            continue
+            # 2026-11-25 Shreyan: 白い発泡スチロール（高さ 2〜3 cm）は、上の面の深度が机とほぼ同じに写る（光が中で散る。中央 3 mm・縁だけ 15〜24 mm）。
+            # 縁が --flat-obj-min より高く出る mask は、床・マット・紙の札ではなく「上の面の深度が取れない物」として、mask の画素を
+            # 床の面からその高さに置いた点にする（光るアルミの上の面と同じ扱い）。本当に平らな物（札・マット）は縁も 1〜2 mm で今までどおり外す
+            h95 = float(np.percentile(h[valid], 95))
+            if a.flat_obj_min > 0 and h95 >= a.flat_obj_min:
+                flat_obj_h = min(h95, a.hmax)
+            else:
+                n_plane += 1
+                _why(i, f"plane (edges {h95 * 1000:.0f} mm)")
+                continue
         ok = valid & (h > a.plane_dist) & (h < a.hmax)
-        if ok.sum() >= max(60, 0.25 * m.sum()):
+        if flat_obj_h is not None:
+            # 机から上の面までを層で埋めた中身の詰まった点にする（上の面だけの薄い板だと GraspGenX が物の厚みを見られず、
+            # どこに置いても掴み方が立たなかった・2026-11-25 Shreyan）。層は 5 mm ごと
+            ray = np.stack([(uu - K[0, 2]) / K[0, 0], (vv - K[1, 2]) / K[1, 1], np.ones(len(uu))], 1)
+            layers = []
+            for hz in np.arange(0.005, flat_obj_h + 1e-6, 0.005):
+                t = (hz - dd) / (ray @ n)
+                layers.append((ray * t[:, None])[t > 0])
+            pts, src = np.vstack(layers), "plane+height(top unseen)"
+        elif ok.sum() >= max(60, 0.25 * m.sum()):
             pts, src = P[ok], "depth"
         elif valid.sum() >= 0.5 * m.sum():  # 深度はあるのに、床の上の高さの範囲に点が足りない（--hmax より高い物・腕など）
             _why(i, f"height (ok {int(ok.sum())}/{int(m.sum())} px between {a.plane_dist}..{a.hmax} m)")
@@ -470,6 +487,9 @@ def main(argv=None) -> int:
     ap.add_argument("--plane-frac", type=float, default=0.6,
                     help="--yoloe: 深度のある画素のうち床の面の上の割合がこれより多い mask は、床・マットとして対象を選ぶ前に外す")
     ap.add_argument("--obj-height", type=float, default=0.02, help="--yoloe: assumed object height [m] when its depth is missing")
+    ap.add_argument("--flat-obj-min", type=float, default=0.012,
+                    help="--yoloe: 床のように平らに写る mask でも、縁の高さ（95 パーセンタイル）がこれ以上なら、上の面の深度が取れない物（白い発泡スチロール）"
+                         "として残す [m]。0 で今までどおり外す（2026-11-25 Shreyan）")
     a = ap.parse_args(argv)
     if a.list_targets:
         print("\n".join(objects.names()))

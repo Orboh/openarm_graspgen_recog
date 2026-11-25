@@ -82,6 +82,16 @@ def main() -> int:
         o = robot.get_observation()
         return [float(o[f"{j}.pos"]) for j in J], float(o["gripper.pos"])
 
+    def rest_up(dz: float = 0.08):
+        """休みの姿勢の手先を真上へ dz 上げた姿勢 [deg]（park の経由点）。解けなければ None。"""
+        import numpy as np
+        import pinocchio as pin
+        from ik.openarm_left_ik import OpenArmIK
+        ik = OpenArmIK(side=side)
+        q0 = ik.clamp(np.deg2rad(rest)); M = ik.fk(q0)
+        q, ok, _, _ = ik.solve(pin.SE3(M.rotation, M.translation + np.array([0, 0, dz])), q0, position_only=False, max_iter=300)
+        return list(np.rad2deg(q)) if ok and ik.within_limits(q) else None
+
     def park() -> dict:
         """休みの姿勢へ戻して脱力する。支えていなければ脱力だけ。当たるなら動かさない。"""
         if st["lost"]:
@@ -92,16 +102,26 @@ def main() -> int:
         q, g = q_now()
         if max(abs(x - y) for x, y in zip(q, rest)) > 1.0:
             client = run_grasp.CUROBO
+            path = [rest]
             if client is not None:  # run_grasp.py の check と同じ考え方: 端がもともと机に近いときは、低い方の端 − 1 cm まで許す
                 client.set_arm(side)
-                d_end = min(client.check_path([p], n=1)[0]["table/arm"][0] for p in (q, rest))
-                bad = client.violations([q, rest], names=["park"], table_margin=min(client.TABLE_MARGIN, d_end - 0.01))
+
+                def blocked(seq):
+                    d_end = min(client.check_path([p], n=1)[0]["table/arm"][0] for p in seq)
+                    return client.violations(seq, table_margin=min(client.TABLE_MARGIN, d_end - 0.01))
+                bad = blocked([q, rest])
+                if bad:  # 置いた所の上で止まっている（--hover）ときなど: 休みの姿勢の 8 cm 上を経由する
+                    mid = rest_up()
+                    if mid is not None and not blocked([q, mid, rest]):
+                        path = [mid, rest]
+                        bad = None
                 if bad:
-                    return {"error": f"休みの姿勢へ戻る直線が当たる（{client.describe(bad)}）。動かさずに支えたまま。"
+                    return {"error": f"休みの姿勢へ戻る道が当たる（{client.describe(bad)}）。動かさずに支えたまま。"
                                      "grasp/tools/release_arm.py で下ろす"}
-            goal = {j: float(rest[i]) for i, j in enumerate(J)}
-            goal["gripper"] = g
-            smooth_move_to_position(robot.bus, goal, PARK_DPS, torque_ff_fn=grav)
+            for tgt in path:
+                goal = {j: float(tgt[i]) for i, j in enumerate(J)}
+                goal["gripper"] = g
+                smooth_move_to_position(robot.bus, goal, PARK_DPS, torque_ff_fn=grav)
         soft_release(robot, grav)  # 中で bus.disable_torque を呼ぶので holding は False になる
         st["holding"] = False
         return {"parked": True, "moved": True}

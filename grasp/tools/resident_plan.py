@@ -45,6 +45,7 @@ class Camera:
         cfg.enable_device(serial)
         cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
         cfg.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+        self.cfg = cfg
         prof = self.pipe.start(cfg)
         self.scale = prof.get_device().first_depth_sensor().get_depth_scale()
         self.align = rs.align(rs.stream.color)
@@ -67,8 +68,12 @@ class Camera:
         def loop():
             k = 0
             while not st["stop"]:
-                with self.lock:
-                    fs = self.pipe.wait_for_frames()
+                try:
+                    with self.lock:
+                        fs = self.pipe.wait_for_frames()
+                except RuntimeError:  # 流れが止まった・始め直している間は待つ（録画のスレッドを落とさない・2026-11-25 Shreyan）
+                    time.sleep(0.2)
+                    continue
                 k += 1
                 if k % max(1, round(30 / fps)) == 0:
                     vw.write(np.asanyarray(fs.get_color_frame().get_data()))
@@ -89,7 +94,30 @@ class Camera:
         st["thread"].join(timeout=5)
         return {"recorded": st["path"], "frames": st["n"], "seconds": round(time.time() - st["t0"], 1)}
 
+    def restart(self, warmup: int = 30):
+        """カメラの流れを止めて始め直す（2026-11-25 Shreyan: 流れが止まって「wait_for_frames cannot be called before start()」になり、
+        その後の撮影が全部失敗して、run_pipeline.sh が明るさの落ち着かない capture.py に切り替わっていた）。"""
+        with self.lock:
+            try:
+                self.pipe.stop()
+            except RuntimeError:
+                pass
+            self.pipe = self.rs.pipeline()
+            self.pipe.start(self.cfg)
+            for _ in range(warmup):
+                self.pipe.wait_for_frames()
+        print("[resident] カメラの流れを始め直した", flush=True)
+
     def grab(self, frames: int = 4):
+        """撮る。流れが止まっていたら 1 度だけ始め直して撮り直す。"""
+        try:
+            return self._grab(frames)
+        except RuntimeError as e:
+            print(f"[resident] 撮れない（{e}）。カメラの流れを始め直す", flush=True)
+            self.restart()
+            return self._grab(frames)
+
+    def _grab(self, frames: int = 4):
         """色 (H,W,3)・深度 [m]・K・内部パラメータの辞書。時間方向のフィルタは毎回作り直す（前の撮影を混ぜない）。"""
         rs = self.rs
         to_disp, to_depth = rs.disparity_transform(True), rs.disparity_transform(False)

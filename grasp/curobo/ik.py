@@ -26,6 +26,9 @@ SEEDS = int(os.environ.get("GRASP_CUROBO_IK_SEEDS", "32"))   # 目標 1 つあ�
 ITERS = os.environ.get("GRASP_CUROBO_IK_ITERS", "")
 
 
+FINGER_LINKS = ("openarm_left_umi_finger_l", "openarm_left_umi_finger_r")
+
+
 class GraspIK:
     """掴み方の link7 の姿勢をまとめて解く。作るのに時間がかかるので、サーバーで 1 度だけ作る。"""
 
@@ -43,6 +46,11 @@ class GraspIK:
         )
         self.ik = InverseKinematics(cfg)
         for ln in PLAN_DISABLE_LINKS:  # 本体にねじ止めした付け根は、いつも本体に触れている
+            self.ik.kinematics.config.kinematics_config.disable_link_spheres(ln)
+        # 指の球は IK の当たりから外す（2026-11-25 Shreyan）。指と机は plan.py が撮った机の面で 6 mm 以上を確かめ、区間の確かめ（check_path）も
+        # 机は指を除いて見る。IK だけが指を入れていて、机の箱（GRASP_FLOOR_Z・実際より 8 mm 高い）に指先が入り、高さ 2 cm の平たい物の掴み方が
+        # 全部「解けない」になっていた。指とほかの物は、爪のすき間と区間の確かめが見る
+        for ln in FINGER_LINKS:
             self.ik.kinematics.config.kinematics_config.disable_link_spheres(ln)
         self.joint_names = list(self.ik.joint_names)
         self.tool = self.ik.tool_frames[0]

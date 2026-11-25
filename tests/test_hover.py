@@ -93,6 +93,20 @@ class HoverTest(unittest.TestCase):
         np.testing.assert_allclose(self.pos(robot), hover, atol=1e-6)
         self.assertEqual(robot.bus.disabled, 0)
 
+    def test_hover_with_place_ends_above_place_spot(self):
+        """置き先のある回で --hover: 置いて離した後は置いた所の上で止まり、raise（休みの姿勢の上）へは戻らない。"""
+        with open(os.path.join(self.cap, "plan.json"), "w") as f:
+            json.dump({**PLAN, "q_carry_deg": PLAN["q_lift_deg"], "q_place_deg": PLAN["q_grasp_deg"]}, f)
+        robot = FakeRobot(REST)
+        rc, out = self.run_main(robot, "--hover", "--keep-torque")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("release done", out)
+        self.assertIn("up from the new spot done", out)
+        self.assertNotIn("back to raise", out)
+        self.assertNotIn("back to start done", out)
+        self.assertEqual(robot.bus.disabled, 0)
+        self.assertGreater(self.tcp_z(self.pos(robot)), self.tcp_z(PLAN["q_grasp_deg"]) + 0.03)  # 置いた所の上
+
     def tcp_z(self, q):
         from ik.openarm_left_ik import OpenArmIK
         ik = OpenArmIK(side="left")

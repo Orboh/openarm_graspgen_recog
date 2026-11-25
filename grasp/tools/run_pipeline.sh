@@ -138,7 +138,8 @@ EOF
 )
   if [ -z "$cap" ]; then  # 常駐が無い: このプロセスでカメラを開いて撮る
     cap=$REPO/grasp/runs/cap_$(date +%Y%m%d_%H%M%S)
-    $GRASP_CAMERA_PY grasp/capture.py --out "$cap" --warmup 8 --temporal 4 >/dev/null
+    echo "[pipeline] 計画の常駐で撮れない。capture.py で撮る（明るさが落ち着くまで 30 枚待つ）" >&2
+    $GRASP_CAMERA_PY grasp/capture.py --out "$cap" --warmup 30 --temporal 4 >/dev/null
   fi
   tev "1 capture" "$tc"
   echo "$cap"
@@ -492,7 +493,8 @@ recog_srv() {  # 切り出しと材質の常駐（:5561）: 立っていなけ�
   local t0 log=$HOME/grasp_runs/logs/server_recog.log; t0=$(now)
   mkdir -p "$HOME/grasp_runs/logs"
   echo "[pipeline] 切り出しと材質の常駐（YOLOE・SigLIP2）を立てる"
-  setsid nohup $PY grasp/tools/recog_server.py --bind "tcp://*:${RECOG##*:}" > "$log" 2>&1 < /dev/null &
+  # SigLIP2 は CPU（2026-11-25 Shreyan: 左右の cuRobo が回り込みを作ると 8 GB の GPU が足りなくなった。CPU で 1 物 1.5 秒・同じ答え）
+  GRASP_SIGLIP_DEVICE=${GRASP_SIGLIP_DEVICE:-cpu} setsid nohup $PY grasp/tools/recog_server.py --bind "tcp://*:${RECOG##*:}" > "$log" 2>&1 < /dev/null &
   for _ in $(seq 1 120); do grep -q "で待つ" "$log" 2>/dev/null && { tev "0 start recog server" "$t0"; return 0; }; sleep 1; done
   echo "[pipeline] 切り出しの常駐が立たない（$log）。回ごとに thor_snap.py を起動する" >&2
 }
